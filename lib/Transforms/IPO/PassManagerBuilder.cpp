@@ -57,6 +57,11 @@ static cl::opt<bool> RunLoadCombine("combine-loads", cl::init(false),
                                     cl::Hidden,
                                     cl::desc("Run the load combining pass"));
 
+static cl::opt<bool>
+RunLoopPipeline("loop-pipeline", cl::init(false),
+                cl::Hidden,
+                cl::desc("High-level software pipeline inner loops"));
+
 PassManagerBuilder::PassManagerBuilder() {
     OptLevel = 2;
     SizeLevel = 0;
@@ -70,6 +75,7 @@ PassManagerBuilder::PassManagerBuilder() {
     LoopVectorize = RunLoopVectorization;
     RerollLoops = RunLoopRerolling;
     LoadCombine = RunLoadCombine;
+    LoopPipeline = RunLoopPipeline;
 }
 
 PassManagerBuilder::~PassManagerBuilder() {
@@ -246,6 +252,11 @@ void PassManagerBuilder::populateModulePassManager(PassManagerBase &MPM) {
   if (LoadCombine)
     MPM.add(createLoadCombinePass());
 
+#ifndef TARGET_IS_NOT_SHAVE
+  if (LoopPipeline)
+    MPM.add(createLoopPipelinePass());    // Software-pipeline loops
+#endif
+
   MPM.add(createAggressiveDCEPass());         // Delete dead instructions
   MPM.add(createCFGSimplificationPass()); // Merge & remove BBs
   MPM.add(createInstructionCombiningPass());  // Clean up after everything.
@@ -365,6 +376,11 @@ void PassManagerBuilder::populateLTOPassManager(PassManagerBase &PM,
 
   if (LoadCombine)
     PM.add(createLoadCombinePass());
+
+#ifndef TARGET_IS_NOT_SHAVE
+  if (LoopPipeline)
+    PM.add(createLoopPipelinePass());    // Software-pipeline loops
+#endif
 
   // Cleanup and simplify the code after the scalar optimizations.
   PM.add(createInstructionCombiningPass());

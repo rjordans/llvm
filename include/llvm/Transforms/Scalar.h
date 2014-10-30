@@ -395,6 +395,12 @@ FunctionPass *createSeparateConstOffsetFromGEPPass();
 //
 BasicBlockPass *createLoadCombinePass();
 
+//===----------------------------------------------------------------------===//
+//
+// LoopPipeling - Software pipeline inner loops.
+//
+FunctionPass *createLoopPipelinePass();
+
 } // End llvm namespace
 
 #endif
