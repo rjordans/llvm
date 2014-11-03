@@ -313,6 +313,11 @@ public:
                                  Type *Ty) const;
   virtual unsigned getIntImmCost(Intrinsic::ID IID, unsigned Idx,
                                  const APInt &Imm, Type *Ty) const;
+
+  /// \brief Return the number of scalar operations that can be executed in
+  /// parallel
+  virtual unsigned getScalarFunctionUnitCount() const;
+
   /// @}
 
   /// \name Vector Target Information
@@ -415,6 +420,10 @@ public:
   /// the address indexing mode.
   virtual unsigned getAddressComputationCost(Type *Ty,
                                              bool IsComplex = false) const;
+
+  /// \brief Return the number of vector operations that can be executed in
+  /// parallel
+  virtual unsigned getVectorFunctionUnitCount() const;
 
   /// @}
 

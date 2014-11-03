@@ -230,6 +230,14 @@ unsigned TargetTransformInfo::getReductionCost(unsigned Opcode, Type *Ty,
   return PrevTTI->getReductionCost(Opcode, Ty, IsPairwise);
 }
 
+unsigned TargetTransformInfo::getScalarFunctionUnitCount() const {
+  return PrevTTI->getScalarFunctionUnitCount();
+}
+
+unsigned TargetTransformInfo::getVectorFunctionUnitCount() const {
+  return PrevTTI->getVectorFunctionUnitCount();
+}
+
 namespace {
 
 struct NoTTI final : ImmutablePass, TargetTransformInfo {
@@ -611,6 +619,14 @@ struct NoTTI final : ImmutablePass, TargetTransformInfo {
 
   unsigned getReductionCost(unsigned, Type *, bool) const override {
     return 1;
+  }
+
+  unsigned getScalarFunctionUnitCount() const override {
+	return 3;
+  }
+
+  unsigned getVectorFunctionUnitCount() const override {
+	return 0;
   }
 };
 
