@@ -52,6 +52,18 @@ static void addInnerLoop(Loop &L, SmallVectorImpl<Loop *> &V) {
 }
 
 namespace {
+  // Container for gathered information about the current loop body
+  struct LoopPipelineInfo {
+    BasicBlock *LoopBody;
+
+    CodeMetrics CM;
+
+    std::unordered_map<Instruction *, unsigned> ASAPtimes;
+    std::unordered_map<Instruction *, unsigned> ALAPtimes;
+
+    unsigned LoopLatency;
+  };
+
   class LoopPipeline : public FunctionPass {
   public:
     static char ID; // Pass identification, replacement for typeid
@@ -98,10 +110,11 @@ namespace {
     TargetTransformInfo *TTI;
 
     bool processLoop(Loop *L);
-    bool canPipelineLoop(Loop *L, CodeMetrics &CM);
-    unsigned computeRecurrenceMII(Loop *L);
-    unsigned computeResourceMII(CodeMetrics &CM);
+    bool canPipelineLoop(Loop *L, LoopPipelineInfo &LPI);
+    unsigned computeRecurrenceMII(Loop *L, LoopPipelineInfo &LPI);
+    unsigned computeResourceMII(LoopPipelineInfo &LPI);
     unsigned getInstructionCost(const Instruction *I) const;
+    bool transformLoop(Loop *L, unsigned MII, LoopPipelineInfo &LPI);
   };
 }
 
@@ -126,14 +139,14 @@ bool LoopPipeline::processLoop(Loop *L) {
   DEBUG(dbgs() << "LP: processing '" << LoopBody->getName() << "'\n");
 
   // Check if loop is a candidate
-  CodeMetrics CM;
-  if( !canPipelineLoop(L, CM) ) {
+  LoopPipelineInfo LPI;
+  if( !canPipelineLoop(L, LPI) ) {
     DEBUG(dbgs() << "LP: failed to pipeline loop\n");
     return false;
   }
 
   // Estimate RecMII
-  unsigned RecMII = computeRecurrenceMII(L);
+  unsigned RecMII = computeRecurrenceMII(L, LPI);
   if( RecMII == 0 ) {
     DEBUG(dbgs() << "LP: failed to compute RecMII\n");
     return false;
@@ -141,22 +154,20 @@ bool LoopPipeline::processLoop(Loop *L) {
   DEBUG(dbgs() << "LP: Found recurrence MII of " << RecMII << '\n');
 
   // Estimate ResMII
-  unsigned ResMII = computeResourceMII(CM);
+  unsigned ResMII = computeResourceMII(LPI);
   DEBUG(dbgs() << "LP: Found resource MII of " << ResMII << '\n');
 
 
   // Decide MII
   unsigned MII = std::max(RecMII, ResMII);
-  DEBUG(dbgs() << "LP: software pipelining loop with MII=" << MII << '\n');
+  // Check if MII <= ASAP loop latency
+  if( MII > LPI.LoopLatency) {
+    DEBUG(dbgs() << "LP: MII larger than ASAP latency, no benefits expected for loop pipelining\n");
+    return false;
+  }
 
-  // TODO: Perform actual software pipelining
-  // - 'Schedule'
-  // - Generate new inner loop
-  // - Construct prologue/epilogue
-
-  // Done
-  LoopsPipelined++;
-  return true;
+  // Perform actual software pipelining
+  return transformLoop(L, MII, LPI);
 }
 
 //***************************************************************************
@@ -165,7 +176,7 @@ bool LoopPipeline::processLoop(Loop *L) {
 //
 // Determine if a loop is a valid candidate for software pipelining
 //
-bool LoopPipeline::canPipelineLoop(Loop *L, CodeMetrics &CM) {
+bool LoopPipeline::canPipelineLoop(Loop *L, LoopPipelineInfo &LPI) {
   // Check if loop body has no control flow (single BasicBlock)
   unsigned NumBlocks = L->getNumBlocks();
   if( NumBlocks != 1 ) {
@@ -179,14 +190,14 @@ bool LoopPipeline::canPipelineLoop(Loop *L, CodeMetrics &CM) {
   // FIXME v3.6 updated interface, needs AssumptionTracker
   BasicBlock *B = L->getBlocks()[0];
 
-  CM.analyzeBasicBlock(B, *TTI);
-  if( CM.NumCalls > 0 ) {
+  LPI.CM.analyzeBasicBlock(B, *TTI);
+  if( LPI.CM.NumCalls > 0 ) {
     // NumCalls also includes inline assembly
     DEBUG(dbgs() << "LP: Can not software-pipeline loops with function calls\n");
     return false;
   }
 
-  if( CM.notDuplicatable ) {
+  if( LPI.CM.notDuplicatable ) {
     DEBUG(dbgs() << "LP: Loop contains operations marked 'noduplicate'\n");
     return false;
   }
@@ -198,12 +209,12 @@ bool LoopPipeline::canPipelineLoop(Loop *L, CodeMetrics &CM) {
 
   // Check loop for anti-dependencies through store-load combinations
   // TODO: add a dependency breaking pass
-  BasicBlock *LoopBody = L->getBlocks()[0];
+  LPI.LoopBody = L->getBlocks()[0];
 
   // Build lists of read and write operations for memory dependence checking
   SmallVector<Instruction*, 2> Writes;
   SmallVector<Instruction*, 4> Reads;
-  for(auto I = LoopBody->begin(), E = LoopBody->end(); I != E; I++) {
+  for(auto I = LPI.LoopBody->begin(), E = LPI.LoopBody->end(); I != E; I++) {
     Instruction *Inst = cast<Instruction>(I);
 
     if( Inst->mayReadFromMemory() )
@@ -253,38 +264,38 @@ bool LoopPipeline::canPipelineLoop(Loop *L, CodeMetrics &CM) {
 //
 // Find the minimal initiation interval for the loop recurrences
 //
-unsigned LoopPipeline::computeRecurrenceMII(Loop *L) {
+unsigned LoopPipeline::computeRecurrenceMII(Loop *L, LoopPipelineInfo &LPI) {
   // At this point, all loop carried dependencies are modelled through phi nodes
   // Find the maximum length cycle through these phi nodes to get the RecMII
-  BasicBlock *LoopBody = L->getBlocks()[0];
+  BasicBlock *LoopBody = LPI.LoopBody;
 
   // Compute ASAP times for all operations in the loop body
-  // TODO consider presetting the number of buckets for improved performance
-  std::unordered_map<Instruction *, unsigned> ASAPtimes;
   unsigned LoopLatency = 0;
   for(auto I = LoopBody->begin(), E = LoopBody->end(); I != E; I++) {
     unsigned OperandsASAP = 0;
 
     // find I's in-loop operands
-    for(auto &O : I->operands()) {
-      Instruction *Op = dyn_cast<Instruction>(O);
-      if( !Op ) continue;
+    if( !isa<PHINode>(I) ) {
+      for(auto &O : I->operands()) {
+        Instruction *Op = dyn_cast<Instruction>(O);
+        if( !Op ) continue;
 
-      if( Op->getParent() == LoopBody ) {
-        // get maximum schedule time
-        OperandsASAP = std::max(OperandsASAP, ASAPtimes[Op]);
+        if( Op->getParent() == LoopBody ) {
+          // get maximum schedule time
+          OperandsASAP = std::max(OperandsASAP, LPI.ASAPtimes[Op] + getInstructionCost(Op));
+        }
       }
     }
 
-    ASAPtimes[I] = OperandsASAP + getInstructionCost(I);
+    LPI.ASAPtimes[I] = OperandsASAP;
 
     // keep track of loop latency for ALAPtimes computation
-    LoopLatency = std::max(LoopLatency, ASAPtimes[I]);
+    LoopLatency = std::max(LoopLatency, OperandsASAP + getInstructionCost(I));
   }
 
+  LPI.LoopLatency = LoopLatency;
+
   // Compute ALAP times for all operations in the loop body in reverse
-  // TODO consider presetting the number of buckets for improved performance
-  std::unordered_map<Instruction *, unsigned> ALAPtimes;
   for(auto I = LoopBody->end(), E = LoopBody->begin(); I != E;) {
     Instruction *II = --I;
     unsigned DepsALAP = LoopLatency;
@@ -294,13 +305,13 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L) {
       Instruction *Dep = dyn_cast<Instruction>(D);
       if( !Dep ) continue;
 
-      if( Dep->getParent() == LoopBody && ALAPtimes.find(Dep) != ALAPtimes.end() ) {
+      if( Dep->getParent() == LoopBody && LPI.ALAPtimes.find(Dep) != LPI.ALAPtimes.end() ) {
         // get minimum schedule time
-        DepsALAP = std::min(DepsALAP, ALAPtimes[Dep]-getInstructionCost(Dep));
+        DepsALAP = std::min(DepsALAP, LPI.ALAPtimes[Dep]-getInstructionCost(Dep));
       }
     }
 
-    ALAPtimes[II] = DepsALAP;
+    LPI.ALAPtimes[II] = DepsALAP;
   }
 
   // Find the phi node that depends on the highest latency operation
@@ -314,8 +325,11 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L) {
       Instruction *II = dyn_cast<Instruction>(Phi->getIncomingValue(i));
       if( !II ) continue;
 
-      if( ALAPtimes[I] <= ASAPtimes[II] )
-        MaxCycleLength = std::max(MaxCycleLength, ASAPtimes[II] - ALAPtimes[I]);
+      if( LPI.ALAPtimes[I] <= LPI.ASAPtimes[II] )
+        MaxCycleLength = std::max(
+            MaxCycleLength,
+            LPI.ASAPtimes[II] - LPI.ALAPtimes[I] + getInstructionCost(II)
+          );
     }
   }
 
@@ -344,14 +358,14 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L) {
 //
 // Extensions:
 // - Use Number of cut edges (phi nodes) for new graph to estimate RF pressure
-unsigned LoopPipeline::computeResourceMII(CodeMetrics &CM) {
+unsigned LoopPipeline::computeResourceMII(LoopPipelineInfo &LPI) {
   unsigned ResMII = 0;
-  unsigned NumScalarInsts = CM.NumInsts - CM.NumVectorInsts;
+  unsigned NumScalarInsts = LPI.CM.NumInsts - LPI.CM.NumVectorInsts;
   const unsigned ScalarFUCount = TTI->getScalarFunctionUnitCount();
   const unsigned VectorFUCount = TTI->getVectorFunctionUnitCount();
 
-  DEBUG(dbgs() << "LP: NumInsts=" << CM.NumInsts
-        << ", NumVectorInsts=" << CM.NumVectorInsts << '\n');
+  DEBUG(dbgs() << "LP: NumInsts=" << LPI.CM.NumInsts
+        << ", NumVectorInsts=" << LPI.CM.NumVectorInsts << '\n');
 
   DEBUG(dbgs() << "LP: ScalarFUs=" << ScalarFUCount
         << ", VectorFUs=" << VectorFUCount << '\n');
@@ -363,7 +377,7 @@ unsigned LoopPipeline::computeResourceMII(CodeMetrics &CM) {
   if(VectorFUCount) {
     ResMII = std::max(
       ResMII,
-      (CM.NumVectorInsts + VectorFUCount - 1) / VectorFUCount);
+      (LPI.CM.NumVectorInsts + VectorFUCount - 1) / VectorFUCount);
   }
 
   return ResMII;
@@ -507,5 +521,30 @@ unsigned LoopPipeline::getInstructionCost(const Instruction *I) const {
     // We don't have any information on this instruction.
     return -1;
   }
+}
+
+//***************************************************************************
+// Schedule operations and generate transformed loop
+//***************************************************************************
+//
+bool LoopPipeline::transformLoop(Loop *L, unsigned MII, LoopPipelineInfo &LPI) {
+  DEBUG(dbgs() << "LP: software pipelining loop with MII=" << MII << '\n');
+  LPI.LoopBody->dump();
+
+  DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost)\n  S L M C\n");
+  for(auto I=LPI.LoopBody->begin(), E=LPI.LoopBody->end(); I != E; I++) {
+    unsigned ASAP = LPI.ASAPtimes[I],
+             ALAP = LPI.ALAPtimes[I],
+             MOB = ALAP - ASAP;
+    DEBUG(dbgs() << "  " << ASAP << " " << ALAP << " " << MOB << " " << getInstructionCost(I) << '\n');
+  }
+  // Construct node ordering
+  // Schedule
+  // Generate new inner loop
+  // Construct prologue/epilogue
+
+  // Done
+  LoopsPipelined++;
+  return true;
 }
 
