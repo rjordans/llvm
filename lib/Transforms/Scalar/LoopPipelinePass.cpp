@@ -204,6 +204,15 @@ bool LoopPipeline::canPipelineLoop(Loop *L, LoopPipelineInfo &LPI) {
   // TODO: Add more checks
   // - Iteration count?
   // - Constant stride
+#if 0
+  // Analyzable loop - disabled, this seems to strong a limitation
+  // Effectively limits us to forward loops with +1 increment
+  if( !L->getCanonicalInductionVariable() ) {
+    DEBUG(dbgs() << "LP: Loop not in analyzable form, try running Induction Variable Simplification first\n");
+    return false;
+  }
+#endif
+
   // - Loop optimization hints
   // - ...
 
@@ -270,7 +279,7 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, LoopPipelineInfo &LPI) {
   BasicBlock *LoopBody = LPI.LoopBody;
 
   // Compute ASAP times for all operations in the loop body
-  unsigned LoopLatency = 0;
+  unsigned LastOperationStart = 0;
   for(auto I = LoopBody->begin(), E = LoopBody->end(); I != E; I++) {
     unsigned OperandsASAP = 0;
 
@@ -290,15 +299,15 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, LoopPipelineInfo &LPI) {
     LPI.ASAPtimes[I] = OperandsASAP;
 
     // keep track of loop latency for ALAPtimes computation
-    LoopLatency = std::max(LoopLatency, OperandsASAP + getInstructionCost(I));
+    LastOperationStart = std::max(LastOperationStart, OperandsASAP);
   }
 
-  LPI.LoopLatency = LoopLatency;
+  LPI.LoopLatency = LastOperationStart;
 
   // Compute ALAP times for all operations in the loop body in reverse
   for(auto I = LoopBody->end(), E = LoopBody->begin(); I != E;) {
     Instruction *II = --I;
-    unsigned DepsALAP = LoopLatency;
+    unsigned DepsALAP = LastOperationStart;
 
     // find I's in-loop users
     for(auto D : II->users()) {
@@ -307,15 +316,14 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, LoopPipelineInfo &LPI) {
 
       if( Dep->getParent() == LoopBody && LPI.ALAPtimes.find(Dep) != LPI.ALAPtimes.end() ) {
         // get minimum schedule time
-        DepsALAP = std::min(DepsALAP, LPI.ALAPtimes[Dep]-getInstructionCost(Dep));
+        DepsALAP = std::min(DepsALAP, LPI.ALAPtimes[Dep]-getInstructionCost(I));
       }
     }
-
     LPI.ALAPtimes[II] = DepsALAP;
   }
 
   // Find the phi node that depends on the highest latency operation
-  unsigned MaxCycleLength = 0;
+  unsigned MaxCycleLength = 1;
   for(auto I = LoopBody->begin(), E = LoopBody->end(); I != E; I++) {
     const PHINode *Phi = dyn_cast<PHINode>(I);
     if( !Phi )
@@ -323,16 +331,39 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, LoopPipelineInfo &LPI) {
 
     for(unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
       Instruction *II = dyn_cast<Instruction>(Phi->getIncomingValue(i));
-      if( !II ) continue;
+      if( !II || II->getParent() != LoopBody ) continue;
 
-      if( LPI.ALAPtimes[I] <= LPI.ASAPtimes[II] )
+      // FIXME - Check if this is correct, current examples seem to be handled
+      //  correctly but that's no guarantee although it does seem to provide a
+      //  lower bound
+      //
+      // Cases not currently handled:
+      // - Cycles that pass through multiple phi nodes
+      // - Cycles with slack in both ASAP and ALAP schedules
+      // - ...
+      //
+      // Possible (though expensive) alternative:
+      //  For each phi node
+      //    Decend into graph, counting depth from node as in ASAP scheduling
+      //    For each node, keep track of the set of parents that gave the longest latency so far
+      //  For each dependence of a phi node on it's tree, add the back-tracked set of nodes as critical cycle(s)
+      //
+      // - May miss shorter cycles that overlap with a longer one
+      // - Still misses the cycles which pass through multiple phi nodes
+
+      if( LPI.ALAPtimes[I] )  {
         MaxCycleLength = std::max(
             MaxCycleLength,
-            LPI.ASAPtimes[II] - LPI.ALAPtimes[I] + getInstructionCost(II)
+            LPI.ALAPtimes[II] - LPI.ALAPtimes[I] + getInstructionCost(II)
           );
+      } else {
+        MaxCycleLength = std::max(
+            MaxCycleLength,
+            LPI.ASAPtimes[II] + getInstructionCost(II)
+          );
+      }
     }
   }
-
   return MaxCycleLength;
 }
 
@@ -346,18 +377,15 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, LoopPipelineInfo &LPI) {
 // Uses NumVectorInsts and NumInsts from CodeMetrics for FU utilization
 // estimation
 //
-// FIXME: This has a very limited view of the processor resources
-//
+// This has a very limited view of the processor resources
 // - Vectorized IR code is assumed to be executed on vector function units
 // - Default values of NoTTI impose no constraints on resources
 // - No constraint for the number of parallel memory accesses for loops with
 //   high memory bandwidth
 //
+// TODO:
 // Make this conditional to observe the effect of adding resource constraints
 // versus the approach taken in Ben-Asher & Meisler
-//
-// Extensions:
-// - Use Number of cut edges (phi nodes) for new graph to estimate RF pressure
 unsigned LoopPipeline::computeResourceMII(LoopPipelineInfo &LPI) {
   unsigned ResMII = 0;
   unsigned NumScalarInsts = LPI.CM.NumInsts - LPI.CM.NumVectorInsts;
@@ -527,18 +555,23 @@ unsigned LoopPipeline::getInstructionCost(const Instruction *I) const {
 // Schedule operations and generate transformed loop
 //***************************************************************************
 //
+// Extensions:
+// - Improved cycle detection algorithm for finding maximum length cycle
+// - Use Number of cut edges (phi nodes) for new graph to estimate RF pressure
 bool LoopPipeline::transformLoop(Loop *L, unsigned MII, LoopPipelineInfo &LPI) {
-  DEBUG(dbgs() << "LP: software pipelining loop with MII=" << MII << '\n');
-  LPI.LoopBody->dump();
+  DEBUG(dbgs() << "LP: Software pipelining loop with MII=" << MII << '\n');
 
   DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost)\n  S L M C\n");
   for(auto I=LPI.LoopBody->begin(), E=LPI.LoopBody->end(); I != E; I++) {
     unsigned ASAP = LPI.ASAPtimes[I],
              ALAP = LPI.ALAPtimes[I],
              MOB = ALAP - ASAP;
-    DEBUG(dbgs() << "  " << ASAP << " " << ALAP << " " << MOB << " " << getInstructionCost(I) << '\n');
+    DEBUG(dbgs() << "  " << ASAP << " " << ALAP << " " << MOB << " " << getInstructionCost(I); I->dump());
   }
+
   // Construct node ordering
+  // Enumerate cycles
+
   // Schedule
   // Generate new inner loop
   // Construct prologue/epilogue
