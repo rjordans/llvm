@@ -104,6 +104,8 @@ namespace {
     unsigned computeResourceMII(CodeMetrics &CM);
     unsigned getInstructionCost(const Instruction *I) const;
     bool transformLoop(Loop *L, unsigned MII, std::set<std::set<Instruction *>> &cycles );
+    unsigned scheduleASAP(BasicBlock *B, std::unordered_map<Instruction *, unsigned> &schedule);
+    void scheduleALAP(BasicBlock *B, unsigned LastOperationStart, std::unordered_map<Instruction *, unsigned> &schedule);
   };
 }
 
@@ -520,8 +522,7 @@ unsigned LoopPipeline::getInstructionCost(const Instruction *I) const {
 // Extensions:
 // - Improved cycle detection algorithm for finding maximum length cycle
 // - Use Number of phi nodes for new graph to estimate RF pressure
-bool LoopPipeline::transformLoop(Loop *L, unsigned MII,
-                                 std::set<std::set<Instruction *>> &cycles) {
+bool LoopPipeline::transformLoop(Loop *L, unsigned MII, std::set<std::set<Instruction *>> &cycles) {
   DEBUG(dbgs() << "LP: Software pipelining loop with MII=" << MII << '\n');
   BasicBlock *LoopBody = L->getBlocks()[0];
 
@@ -529,53 +530,25 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII,
   std::unordered_map<Instruction *, unsigned> ALAPtimes;
 
   // Compute ASAP times for all operations in the loop body
-  unsigned LastOperationStart = 0;
-  for(auto I = LoopBody->begin(), E = LoopBody->end(); I != E; I++) {
-    unsigned OperandsASAP = 0;
-
-    // find I's in-loop operands
-    if( !isa<PHINode>(I) ) {
-      for(auto &O : I->operands()) {
-        Instruction *Op = dyn_cast<Instruction>(O);
-        if( !Op ) continue;
-
-        if( Op->getParent() == LoopBody ) {
-          // get maximum schedule time
-          OperandsASAP = std::max(OperandsASAP, ASAPtimes[Op] + getInstructionCost(Op));
-        }
-      }
-    }
-
-    ASAPtimes[I] = OperandsASAP;
-
-    // keep track of loop latency for ALAPtimes computation
-    LastOperationStart = std::max(LastOperationStart, OperandsASAP);
-  }
+  unsigned LastOperationStart = scheduleASAP(LoopBody, ASAPtimes);
 
   // Compute ALAP times for all operations in the loop body in reverse
-  for(auto I = LoopBody->end(), E = LoopBody->begin(); I != E;) {
-    Instruction *II = --I;
-    unsigned DepsALAP = LastOperationStart;
+  scheduleALAP(LoopBody, LastOperationStart, ALAPtimes);
 
-    // find I's in-loop users
-    for(auto D : II->users()) {
-      Instruction *Dep = dyn_cast<Instruction>(D);
-      if( !Dep ) continue;
-
-      if( Dep->getParent() == LoopBody && ALAPtimes.find(Dep) != ALAPtimes.end() ) {
-        // get minimum schedule time
-        DepsALAP = std::min(DepsALAP, ALAPtimes[Dep]-getInstructionCost(I));
-      }
-    }
-    ALAPtimes[II] = DepsALAP;
-  }
-
-  DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost)\n  S L M C\n");
+  // Debug print computed values
+  DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost, Depth, Height)\n  S L M D H C\n");
   for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
-    unsigned ASAP = ASAPtimes[I],
-             ALAP = ALAPtimes[I],
-             MOB = ALAP - ASAP;
-    DEBUG(dbgs() << "  " << ASAP << " " << ALAP << " " << MOB << " " << getInstructionCost(I); I->dump());
+    unsigned ASAP     = ASAPtimes[I],
+             ALAP     = ALAPtimes[I],
+             Mobility = ALAP - ASAP,
+             Depth    = ASAP,
+             Height   = LastOperationStart - ALAP,
+             Cost     = getInstructionCost(I);
+
+    DEBUG(
+      dbgs() << "  " << ASAP << " " << ALAP << " " << Mobility << " " << Depth << " " << Height << " " << Cost;
+      I->dump()
+         );
   }
 
   // Construct node ordering
@@ -594,5 +567,53 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII,
   // Done
   LoopsPipelined++;
   return true;
+}
+
+// Helper function - Compute ASAP schedule times
+unsigned LoopPipeline::scheduleASAP(BasicBlock *B, std::unordered_map<Instruction *, unsigned> &schedule) {
+  unsigned LastOperationStart = 0;
+  for(auto I = B->begin(), E = B->end(); I != E; I++) {
+    unsigned OperandsASAP = 0;
+
+    // find I's in-loop operands
+    if( !isa<PHINode>(I) ) {
+      for(auto &O : I->operands()) {
+        Instruction *Op = dyn_cast<Instruction>(O);
+        if( !Op ) continue;
+
+        if( Op->getParent() == B ) {
+          // get maximum schedule time
+          OperandsASAP = std::max(OperandsASAP, schedule[Op] + getInstructionCost(Op));
+        }
+      }
+    }
+
+    schedule[I] = OperandsASAP;
+
+    // keep track of loop latency for ALAPtimes computation
+    LastOperationStart = std::max(LastOperationStart, OperandsASAP);
+  }
+
+  return LastOperationStart;
+}
+
+// Helper function - Compute ALAP schedule times
+void LoopPipeline::scheduleALAP(BasicBlock *B, unsigned LastOperationStart, std::unordered_map<Instruction *, unsigned> &schedule) {
+  for(auto I = B->end(), E = B->begin(); I != E;) {
+    Instruction *II = --I;
+    unsigned DepsALAP = LastOperationStart;
+
+    // find I's in-loop users
+    for(auto D : II->users()) {
+      Instruction *Dep = dyn_cast<Instruction>(D);
+      if( !Dep ) continue;
+
+      if( Dep->getParent() == B && schedule.find(Dep) != schedule.end() ) {
+        // get minimum schedule time
+        DepsALAP = std::min(DepsALAP, schedule[Dep]-getInstructionCost(I));
+      }
+    }
+    schedule[II] = DepsALAP;
+  }
 }
 
