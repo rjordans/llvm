@@ -52,6 +52,8 @@ static void addInnerLoop(Loop &L, SmallVectorImpl<Loop *> &V) {
     addInnerLoop(*InnerL, V);
 }
 
+static unsigned getInstructionCost(const Instruction *I, const TargetTransformInfo *TTI);
+
 namespace {
   class LoopPipeline : public FunctionPass {
   public:
@@ -98,22 +100,61 @@ namespace {
     ScalarEvolution *SE;
     TargetTransformInfo *TTI;
 
+    class InstructionTrace {
+    public:
+      InstructionTrace() : weight(0) {}
+      InstructionTrace(const InstructionTrace &IT) : trace(IT.trace), weight(IT.weight) {}
+
+      // Add instruction to trace
+      void add(Instruction *I, TargetTransformInfo *TTI) {
+        trace.insert(I);
+        weight += getInstructionCost(I, TTI);
+      }
+
+      // Access methods
+      unsigned getWeight() const {
+        return weight;
+      }
+      const std::set<Instruction *> &data() const {
+        return trace;
+      }
+      size_t size() const {
+        return trace.size();
+      }
+
+      // Find
+      std::set<Instruction *>::iterator end() const {
+        return trace.end();
+      }
+      std::set<Instruction *>::iterator find(Instruction *I) const {
+        return trace.find(I);
+      }
+
+      // Compare for insertion into set
+      bool operator< (const InstructionTrace &T) const {
+        return weight < T.weight;
+      }
+    private:
+      std::set<Instruction *> trace;
+      unsigned weight;
+    };
+
     typedef std::unordered_map<Instruction *, unsigned> PartialSchedule;
-    typedef std::set<std::set<Instruction *>> CycleSet;
+    typedef std::set<InstructionTrace> CycleSet;
 
     bool processLoop(Loop *L);
     bool canPipelineLoop(Loop *L, CodeMetrics &CM);
 
-    void getPhiCycles(Instruction *I, const PHINode *Phi, std::set<Instruction *> trace, CycleSet &cycles);
+    void getPhiCycles(Instruction *I, const PHINode *Phi, InstructionTrace trace, CycleSet &cycles);
     unsigned computeRecurrenceMII(Loop *L, CycleSet &cycles);
     unsigned computeResourceMII(CodeMetrics &CM);
 
     bool transformLoop(Loop *L, unsigned MII, CycleSet &cycles );
 
-    unsigned getInstructionCost(const Instruction *I) const;
     unsigned scheduleASAP(BasicBlock *B, PartialSchedule &schedule);
     void scheduleALAP(BasicBlock *B, unsigned LastOperationStart, PartialSchedule &schedule);
   };
+
 }
 
 char LoopPipeline::ID = 0;
@@ -270,41 +311,38 @@ bool LoopPipeline::canPipelineLoop(Loop *L, CodeMetrics &CM) {
 
 // Helper function to find loop dependency cycles through phi nodes
 void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
-                         std::set<Instruction *> trace,
+                         InstructionTrace trace,
                          CycleSet &cycles) {
   // stay within the loop body
   if( I->getParent() != Phi->getParent() ) return;
 
-  // found a cycle
+  // found a cycle when we end up at our start point
   if( I == Phi && trace.size() != 0 ) {
-    DEBUG(dbgs() << "LP: Found cycle\n";
-      for(auto II : trace)
-        II->dump();
-      );
-
     cycles.insert(trace);
     return;
   }
 
   // found a cycle not passing through the currently considered phi-node
-  if( trace.find(I) != trace.end() ) {
+  // for example: a -> b -> c -> b, this can only happen if b is a phi-node
+  if( isa<PHINode>(I) && trace.find(I) != trace.end() ) {
     return;
   }
 
-  // check cycles for each operand of the instruction
-  std::set<Instruction *> new_trace(trace);
-  new_trace.insert(I);
+  // add current instruction and check cycles for each operand of the instruction
+  trace.add(I, TTI);
   if( isa<PHINode>(I) ) {
     PHINode *P = cast<PHINode>(I);
 
     for(unsigned i = 0; i < P->getNumIncomingValues(); i++) {
       Instruction *II = dyn_cast<Instruction>(P->getIncomingValue(i));
-      if(II && II->getParent() == Phi->getParent()) getPhiCycles(II, Phi, new_trace, cycles);
+      if(II && II->getParent() == I->getParent())
+        getPhiCycles(II, Phi, trace, cycles);
     }
   } else {
     for(auto &O : I->operands() ) {
       Instruction *II = dyn_cast<Instruction>(O);
-      if(II) getPhiCycles(II, Phi, new_trace, cycles);
+      if(II && II->getParent() == I->getParent())
+        getPhiCycles(II, Phi, trace, cycles);
     }
   }
 }
@@ -320,22 +358,13 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, CycleSet &cycles) {
     if( !Phi )
       continue;
 
-    std::set<Instruction *> trace;
+    InstructionTrace trace;
     getPhiCycles(Phi, Phi, trace, cycles);
-
-    DEBUG(dbgs() << '\n');
   }
 
-  unsigned MaxCycleLength = 0;
-  for(auto &cycle : cycles) {
-    unsigned cycleLength = 0;
-    for(auto I : cycle)
-      cycleLength += getInstructionCost(I);
-
-    MaxCycleLength = std::max(cycleLength, MaxCycleLength);
-  }
-
-  return MaxCycleLength;
+  // cycles are sorted by weight, last cycle in the set has highest weight
+  DEBUG(dbgs() << "LP: Found " << cycles.size() << " cycle(s)\n");
+  return cycles.rbegin()->getWeight();
 }
 
 //***************************************************************************
@@ -406,7 +435,7 @@ static TargetTransformInfo::OperandValueKind getOperandInfo(Value *V) {
   return OpInfo;
 }
 
-unsigned LoopPipeline::getInstructionCost(const Instruction *I) const {
+static unsigned getInstructionCost(const Instruction *I, const TargetTransformInfo *TTI) {
 
   switch (I->getOpcode()) {
   case Instruction::GetElementPtr:{
@@ -550,7 +579,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
              Mobility = ALAP - ASAP,
              Depth    = ASAP,
              Height   = LastOperationStart - ALAP,
-             Cost     = getInstructionCost(I);
+             Cost     = getInstructionCost(I, TTI);
 
     DEBUG(
       dbgs() << "  " << ASAP << " " << ALAP << " " << Mobility << " " << Depth << " " << Height << " " << Cost;
@@ -565,7 +594,16 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   //     - find connected cycles through llvm node ordering and add connecting nodes to lower priority cycle
   //     - mark added nodes as done
   // - add remaining nodes as last set
+  int i = cycles.size();
+  for(auto cycle=cycles.rbegin(), E=cycles.rend(); cycle != E; cycle++) {
+    DEBUG(dbgs() << "\nLP: Cycle " << --i << '\n');
 
+    for(auto I : cycle->data()) {
+      DEBUG(I->dump());
+    }
+
+    DEBUG(dbgs() << "LP: Length " << cycle->getWeight() << '\n');
+  }
 
   // Schedule
   // Generate new inner loop
@@ -590,7 +628,7 @@ unsigned LoopPipeline::scheduleASAP(BasicBlock *B, PartialSchedule &schedule) {
 
         if( Op->getParent() == B ) {
           // get maximum schedule time
-          OperandsASAP = std::max(OperandsASAP, schedule[Op] + getInstructionCost(Op));
+          OperandsASAP = std::max(OperandsASAP, schedule[Op] + getInstructionCost(Op, TTI));
         }
       }
     }
@@ -617,7 +655,7 @@ void LoopPipeline::scheduleALAP(BasicBlock *B, unsigned LastOperationStart, Part
 
       if( Dep->getParent() == B && schedule.find(Dep) != schedule.end() ) {
         // get minimum schedule time
-        DepsALAP = std::min(DepsALAP, schedule[Dep]-getInstructionCost(I));
+        DepsALAP = std::min(DepsALAP, schedule[Dep]-getInstructionCost(I, TTI));
       }
     }
     schedule[II] = DepsALAP;
