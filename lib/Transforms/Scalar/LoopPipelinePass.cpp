@@ -98,14 +98,21 @@ namespace {
     ScalarEvolution *SE;
     TargetTransformInfo *TTI;
 
+    typedef std::unordered_map<Instruction *, unsigned> PartialSchedule;
+    typedef std::set<std::set<Instruction *>> CycleSet;
+
     bool processLoop(Loop *L);
     bool canPipelineLoop(Loop *L, CodeMetrics &CM);
-    unsigned computeRecurrenceMII(Loop *L, std::set<std::set<Instruction *>> &cycles);
+
+    void getPhiCycles(Instruction *I, const PHINode *Phi, std::set<Instruction *> trace, CycleSet &cycles);
+    unsigned computeRecurrenceMII(Loop *L, CycleSet &cycles);
     unsigned computeResourceMII(CodeMetrics &CM);
+
+    bool transformLoop(Loop *L, unsigned MII, CycleSet &cycles );
+
     unsigned getInstructionCost(const Instruction *I) const;
-    bool transformLoop(Loop *L, unsigned MII, std::set<std::set<Instruction *>> &cycles );
-    unsigned scheduleASAP(BasicBlock *B, std::unordered_map<Instruction *, unsigned> &schedule);
-    void scheduleALAP(BasicBlock *B, unsigned LastOperationStart, std::unordered_map<Instruction *, unsigned> &schedule);
+    unsigned scheduleASAP(BasicBlock *B, PartialSchedule &schedule);
+    void scheduleALAP(BasicBlock *B, unsigned LastOperationStart, PartialSchedule &schedule);
   };
 }
 
@@ -137,7 +144,7 @@ bool LoopPipeline::processLoop(Loop *L) {
   }
 
   // Estimate RecMII and obtain a list of loop carried dependencies
-  std::set<std::set<Instruction *>> cycles;
+  CycleSet cycles;
   unsigned RecMII = computeRecurrenceMII(L, cycles);
   if( RecMII == 0 ) {
     DEBUG(dbgs() << "LP: failed to compute RecMII\n");
@@ -262,9 +269,9 @@ bool LoopPipeline::canPipelineLoop(Loop *L, CodeMetrics &CM) {
 //
 
 // Helper function to find loop dependency cycles through phi nodes
-static void getPhiCycles(Instruction *I, const PHINode *Phi,
+void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
                          std::set<Instruction *> trace,
-                         std::set<std::set<Instruction *>> &cycles) {
+                         CycleSet &cycles) {
   // stay within the loop body
   if( I->getParent() != Phi->getParent() ) return;
 
@@ -302,7 +309,7 @@ static void getPhiCycles(Instruction *I, const PHINode *Phi,
   }
 }
 
-unsigned LoopPipeline::computeRecurrenceMII(Loop *L, std::set<std::set<Instruction *>> &cycles) {
+unsigned LoopPipeline::computeRecurrenceMII(Loop *L, CycleSet &cycles) {
   // At this point, all loop carried dependencies are modelled through phi nodes
   // Find the maximum length cycle through these phi nodes to get the RecMII
   BasicBlock *LoopBody = L->getBlocks()[0];
@@ -522,12 +529,12 @@ unsigned LoopPipeline::getInstructionCost(const Instruction *I) const {
 // Extensions:
 // - Improved cycle detection algorithm for finding maximum length cycle
 // - Use Number of phi nodes for new graph to estimate RF pressure
-bool LoopPipeline::transformLoop(Loop *L, unsigned MII, std::set<std::set<Instruction *>> &cycles) {
+bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   DEBUG(dbgs() << "LP: Software pipelining loop with MII=" << MII << '\n');
   BasicBlock *LoopBody = L->getBlocks()[0];
 
-  std::unordered_map<Instruction *, unsigned> ASAPtimes;
-  std::unordered_map<Instruction *, unsigned> ALAPtimes;
+  PartialSchedule ASAPtimes;
+  PartialSchedule ALAPtimes;
 
   // Compute ASAP times for all operations in the loop body
   unsigned LastOperationStart = scheduleASAP(LoopBody, ASAPtimes);
@@ -570,7 +577,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, std::set<std::set<Instru
 }
 
 // Helper function - Compute ASAP schedule times
-unsigned LoopPipeline::scheduleASAP(BasicBlock *B, std::unordered_map<Instruction *, unsigned> &schedule) {
+unsigned LoopPipeline::scheduleASAP(BasicBlock *B, PartialSchedule &schedule) {
   unsigned LastOperationStart = 0;
   for(auto I = B->begin(), E = B->end(); I != E; I++) {
     unsigned OperandsASAP = 0;
@@ -598,7 +605,7 @@ unsigned LoopPipeline::scheduleASAP(BasicBlock *B, std::unordered_map<Instructio
 }
 
 // Helper function - Compute ALAP schedule times
-void LoopPipeline::scheduleALAP(BasicBlock *B, unsigned LastOperationStart, std::unordered_map<Instruction *, unsigned> &schedule) {
+void LoopPipeline::scheduleALAP(BasicBlock *B, unsigned LastOperationStart, PartialSchedule &schedule) {
   for(auto I = B->end(), E = B->begin(); I != E;) {
     Instruction *II = --I;
     unsigned DepsALAP = LastOperationStart;
