@@ -107,7 +107,7 @@ namespace {
 
       // Add instruction to trace
       void add(Instruction *I, TargetTransformInfo *TTI) {
-        trace.insert(I);
+        trace.push_back(I);
         weight += getInstructionCost(I, TTI);
       }
 
@@ -115,7 +115,7 @@ namespace {
       unsigned getWeight() const {
         return weight;
       }
-      const std::set<Instruction *> &data() const {
+      const SmallVector<Instruction *, 8> &data() const {
         return trace;
       }
       size_t size() const {
@@ -123,19 +123,19 @@ namespace {
       }
 
       // Find
-      std::set<Instruction *>::iterator end() const {
-        return trace.end();
-      }
-      std::set<Instruction *>::iterator find(Instruction *I) const {
-        return trace.find(I);
+      const Instruction *find(Instruction *I) const {
+		for(auto II=trace.begin(), E=trace.end(); II != E; II++)
+		  if( *II == I )
+			return *II;
+		return nullptr;
       }
 
       // Compare for insertion into set
       bool operator< (const InstructionTrace &T) const {
-        return weight < T.weight;
+        return weight < T.weight || (this != &T);
       }
     private:
-      std::set<Instruction *> trace;
+      SmallVector<Instruction *, 8> trace;
       unsigned weight;
     };
 
@@ -314,7 +314,8 @@ void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
                          InstructionTrace trace,
                          CycleSet &cycles) {
   // stay within the loop body
-  if( I->getParent() != Phi->getParent() ) return;
+  if( I->getParent() != Phi->getParent() )
+	return;
 
   // found a cycle when we end up at our start point
   if( I == Phi && trace.size() != 0 ) {
@@ -324,7 +325,7 @@ void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
 
   // found a cycle not passing through the currently considered phi-node
   // for example: a -> b -> c -> b, this can only happen if b is a phi-node
-  if( isa<PHINode>(I) && trace.find(I) != trace.end() ) {
+  if( isa<PHINode>(I) && trace.find(I) ) {
     return;
   }
 
@@ -335,14 +336,12 @@ void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
 
     for(unsigned i = 0; i < P->getNumIncomingValues(); i++) {
       Instruction *II = dyn_cast<Instruction>(P->getIncomingValue(i));
-      if(II && II->getParent() == I->getParent())
-        getPhiCycles(II, Phi, trace, cycles);
+      if(II) getPhiCycles(II, Phi, trace, cycles);
     }
   } else {
     for(auto &O : I->operands() ) {
       Instruction *II = dyn_cast<Instruction>(O);
-      if(II && II->getParent() == I->getParent())
-        getPhiCycles(II, Phi, trace, cycles);
+      if(II) getPhiCycles(II, Phi, trace, cycles);
     }
   }
 }
