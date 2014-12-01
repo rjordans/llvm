@@ -17,6 +17,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
@@ -30,7 +31,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 
-#include <unordered_map>
 #include <set>
 
 using namespace llvm;
@@ -139,7 +139,7 @@ namespace {
       unsigned weight;
     };
 
-    typedef std::unordered_map<Instruction *, unsigned> PartialSchedule;
+    typedef DenseMap<Instruction *, unsigned> PartialSchedule;
     typedef std::set<InstructionTrace> CycleSet;
 
     bool processLoop(Loop *L);
