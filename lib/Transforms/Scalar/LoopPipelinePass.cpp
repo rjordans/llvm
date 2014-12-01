@@ -132,7 +132,7 @@ namespace {
 
       // Compare for insertion into set
       bool operator< (const InstructionTrace &T) const {
-        return weight < T.weight || (this != &T);
+        return weight <= T.weight && this != &T;
       }
     private:
       SmallVector<Instruction *, 8> trace;
