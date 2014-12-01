@@ -319,6 +319,7 @@ void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
 
   // found a cycle when we end up at our start point
   if( I == Phi && trace.size() != 0 ) {
+    trace.add(I, TTI);
     cycles.insert(trace);
     return;
   }
@@ -329,8 +330,12 @@ void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
     return;
   }
 
-  // add current instruction and check cycles for each operand of the instruction
-  trace.add(I, TTI);
+  // Add current instruction and check cycles for each operand of the
+  // instruction.  Don't add original Phi node until the cycle is completed
+  // to preserve (reversed) ordering.
+  if( I != Phi )
+	trace.add(I, TTI);
+
   if( isa<PHINode>(I) ) {
     PHINode *P = cast<PHINode>(I);
 
