@@ -716,12 +716,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     enum {BottomUp = 0, TopDown} order;
     SmallVector<Instruction *, 8> Ready;
 
-#if 1
-    DEBUG(dbgs() << "LP: Ordering PrioritySet:\n");
-    for(auto I : *CurrentPrioritySet) {
-      DEBUG(I->dump());
-    }
-#endif
     // Check if SuccessorListO or PredecessorListO is a subset of CurrentPrioritySet
     bool SuccLIsSubsetS = true, PredLIsSubsetS = true;
     for(auto I : SuccessorListO) {
@@ -768,14 +762,10 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     }
 
     while(!Ready.empty()) {
-
       if(order == TopDown) {
-        DEBUG(dbgs() << "v\n");
+        DEBUG(dbgs() << "LP: Swung (v)\n");
         // Top-down ordering
         while(!Ready.empty()) {
-#if 0
-          DEBUG(dbgs() << "LP: Ordering with ready list:\n"; for(auto I : Ready) I->dump());
-#endif
           auto v = Ready.begin();
           // Select operation with the highest height (smallest ALAP)
           // if more than one, choose node with lowest mobility
@@ -787,7 +777,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
             if(tV > tI || (tV == tI && mV > mI) ) v = I;
           }
-          DEBUG(dbgs() << "LP: Adding ordered operation"; (*v)->dump());
           OrderedNodes.push_back(*v);
           AlreadyOrdered[*v] = true;
 
@@ -841,12 +830,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
         order = BottomUp;
       } else {
-        DEBUG(dbgs() << "^\n");
+        DEBUG(dbgs() << "LP: Swing (^)\n");
         // Bottom-up ordering
         while(!Ready.empty()) {
-#if 0
-          DEBUG(dbgs() << "LP: Ordering with ready list:\n"; for(auto I : Ready) I->dump());
-#endif
           auto v = Ready.begin();
           // Select operation with the highest depth (heighest ASAP)
           // if more than one, choose node with lowest mobility
@@ -858,7 +844,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
             if(tV < tI || (tV == tI && mV > mI) ) v = I;
           }
-          DEBUG(dbgs() << "LP: Adding ordered operation"; (*v)->dump());
           OrderedNodes.push_back(*v);
           AlreadyOrdered[*v] = true;
 
@@ -911,11 +896,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         order = TopDown;
       }
     }
-#if 0
-    DEBUG(dbgs() << "LP: Intermediate ordering:\n"; for(auto I : OrderedNodes) I->dump());
-    DEBUG(dbgs() << "LP: New predecessor list:\n"; for(auto I : PredecessorListO) I->dump());
-    DEBUG(dbgs() << "LP: New successor list:\n"; for(auto I : SuccessorListO) I->dump());
-#endif
 
     delete CurrentPrioritySet;
   }
@@ -929,6 +909,8 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   assert(SuccessorListO.empty() && "Missed some nodes...");
 
   // Schedule
+  // TODO schedule!!!
+
   // Generate new inner loop
   // Construct prologue/epilogue
 
