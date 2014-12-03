@@ -18,6 +18,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
@@ -149,6 +151,11 @@ namespace {
     unsigned computeRecurrenceMII(Loop *L, CycleSet &cycles);
     unsigned computeResourceMII(CodeMetrics &CM);
 
+    bool getConnectingNodes(Instruction *I,
+        const BasicBlock *B,
+        DenseMap<Instruction *, bool> &VisitedNodes,
+        std::vector<Instruction *> &connectingNodes,
+        bool direction);
     bool transformLoop(Loop *L, unsigned MII, CycleSet &cycles );
 
     unsigned scheduleASAP(BasicBlock *B, PartialSchedule &schedule);
@@ -560,8 +567,53 @@ static unsigned getInstructionCost(const Instruction *I, const TargetTransformIn
 //***************************************************************************
 //
 // Extensions:
-// - Improved cycle detection algorithm for finding maximum length cycle
 // - Use Number of phi nodes for new graph to estimate RF pressure
+
+// Helper function to find the nodes located at any path between the previous
+// and current recurrence.
+bool LoopPipeline::getConnectingNodes(Instruction *I,
+    const BasicBlock *B,
+    DenseMap<Instruction *, bool> &VisitedNodes,
+    std::vector<Instruction *> &connectingNodes,
+    bool direction)
+{
+  // Do not recurse over nodes outside of the current loop body
+  if(I->getParent() != B) return false;
+
+  // Recurse until a previously visited node is found
+  if(VisitedNodes[I]) return true;
+
+  // Recurse through operands/uses depending on direction
+  bool found = false;
+  if( direction ) {
+    // avoid backedges
+    if(isa<PHINode>(I)) return false;
+
+    // search upwards
+    for(auto &O : I->operands() ) {
+      Instruction *II = dyn_cast<Instruction>(O);
+      if(II) 
+        found |= getConnectingNodes(II, B, VisitedNodes, connectingNodes, direction);
+    }
+  } else {
+    // search downwards
+    for(auto U : I->users() ) {
+      if(isa<PHINode>(U)) continue;
+      Instruction *II = dyn_cast<Instruction>(U);
+      if(II)
+        found |= getConnectingNodes(II, B, VisitedNodes, connectingNodes, direction);
+    }
+  }
+
+  // Add current node to the visited list and to the connecting nodes if a path was found
+  if(found) {
+    VisitedNodes[I] = true;
+    connectingNodes.push_back(I);
+  }
+
+  return found;
+}
+
 bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   DEBUG(dbgs() << "LP: Software pipelining loop with MII=" << MII << '\n');
   BasicBlock *LoopBody = L->getBlocks()[0];
@@ -575,6 +627,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   // Compute ALAP times for all operations in the loop body in reverse
   scheduleALAP(LoopBody, LastOperationStart, ALAPtimes);
 
+#if 1
   // Debug print computed values
   DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost, Depth, Height)\n  S L M D H C\n");
   for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
@@ -590,24 +643,290 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       I->dump()
          );
   }
+#endif
 
-  // Construct node ordering
-  //   - for each found cycle (long to short)
-  //     - get length and insert into correct position in cycle set
-  //     - prune nodes that are in the cycle from lower priority sets
-  //     - find connected cycles through llvm node ordering and add connecting nodes to lower priority cycle
-  //     - mark added nodes as done
-  // - add remaining nodes as last set
-  int i = cycles.size();
+  // Construct priority sets based on the recurrences found earlier sorted by
+  // their weight.  Add all nodes on paths between a previous recurrence and
+  // the inserted one to avoid nodes which have both their ancestors and
+  // successors scheduled.
+  SmallVector<SmallVectorImpl<Instruction *>*, 4> PrioritySets;
+  SmallVector<unsigned, 4> PrioritySetWeights;
+  DenseMap<Instruction *, bool>  VisitedNodes;
+
   for(auto cycle=cycles.rbegin(), E=cycles.rend(); cycle != E; cycle++) {
-    DEBUG(dbgs() << "\nLP: Cycle " << --i << '\n');
+    SmallVectorImpl<Instruction *>  *CurrentPrioritySet =
+      new SmallVector<Instruction *, 8>();
 
+    // Copy nodes from the current recurrence that haven't been visited before.
     for(auto I : cycle->data()) {
-      DEBUG(I->dump());
+      if(VisitedNodes[I]) continue;
+
+      CurrentPrioritySet->push_back(I);
+      VisitedNodes[I] = true;
     }
 
-    DEBUG(dbgs() << "LP: Length " << cycle->getWeight() << '\n');
+    // Add nodes on paths between newly inserted set and the already visited nodes.
+    if(!PrioritySets.empty()) {
+      std::vector<Instruction *> connectingNodes;
+      for(auto I : cycle->data()) {
+        for(auto &O : I->operands() ) {
+          Instruction *II = dyn_cast<Instruction>(O);
+          if(II) getConnectingNodes(II, LoopBody, VisitedNodes, connectingNodes, true);
+        }
+        for(auto U : I->users() ) {
+          Instruction *II = dyn_cast<Instruction>(U);
+          if(II) getConnectingNodes(II, LoopBody, VisitedNodes, connectingNodes, false);
+        }
+      }
+
+      for(auto I : connectingNodes)
+        CurrentPrioritySet->push_back(I);
+    }
+
+    // Only add priority set to the worklist for the node ordering when
+    // the set actually contains operations.
+    if(!CurrentPrioritySet->empty()) {
+      PrioritySetWeights.push_back(cycle->getWeight());
+      PrioritySets.push_back(CurrentPrioritySet);
+    } else {
+      delete CurrentPrioritySet;
+    }
   }
+
+  // Copy the remaining operations into the final priority set.
+  SmallVectorImpl<Instruction *> *AllNodesTrace =
+    new SmallVector<Instruction *, 8>();
+
+  for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
+    if( !VisitedNodes[I] )
+      AllNodesTrace->push_back(I);
+  }
+  PrioritySetWeights.push_back(0);
+  PrioritySets.push_back(AllNodesTrace);
+
+  // Construct node ordering
+  SmallVector<Instruction *, 16> OrderedNodes;
+  DenseMap<Instruction *, bool>  AlreadyOrdered;
+  SmallSet<Instruction *, 8>  PredecessorListO;
+  SmallSet<Instruction *, 8>  SuccessorListO;
+
+  // Compute node scheduling order
+  for(auto CurrentPrioritySet: PrioritySets) {
+    // Compute node ordering
+    enum {BottomUp = 0, TopDown} order;
+    SmallVector<Instruction *, 8> Ready;
+
+#if 1
+    DEBUG(dbgs() << "LP: Ordering PrioritySet:\n");
+    for(auto I : *CurrentPrioritySet) {
+      DEBUG(I->dump());
+    }
+#endif
+    // Check if SuccessorListO or PredecessorListO is a subset of CurrentPrioritySet
+    bool SuccLIsSubsetS = true, PredLIsSubsetS = true;
+    for(auto I : SuccessorListO) {
+      bool found = false;
+      for(auto II : *CurrentPrioritySet)
+        if(I==II) found = true;
+
+      if(!found) {
+        SuccLIsSubsetS = false;
+        break;
+      }
+    }
+
+    for(auto I : PredecessorListO) {
+      bool found = false;
+      for(auto II : *CurrentPrioritySet)
+        if(I==II) found = true;
+
+      if(!found) {
+        PredLIsSubsetS = false;
+        break;
+      }
+    }
+
+    if(!PredecessorListO.empty() && PredLIsSubsetS ) {
+      for(auto I : PredecessorListO)
+        Ready.push_back(I);
+
+      order = BottomUp;
+    } else if(!SuccessorListO.empty() && SuccLIsSubsetS) {
+      for(auto I : SuccessorListO)
+        Ready.push_back(I);
+
+      order = TopDown;
+    } else {
+      // Start with node that has the highest ASAP value in S
+      auto v = CurrentPrioritySet->begin();
+      for(auto I=v, E=CurrentPrioritySet->end(); I != E; I++)
+        if(ASAPtimes[*v] < ASAPtimes[*I] )
+          v = I;
+
+      Ready.push_back(*v);
+      order = BottomUp;
+    }
+
+    while(!Ready.empty()) {
+
+      if(order == TopDown) {
+        DEBUG(dbgs() << "v\n");
+        // Top-down ordering
+        while(!Ready.empty()) {
+#if 0
+          DEBUG(dbgs() << "LP: Ordering with ready list:\n"; for(auto I : Ready) I->dump());
+#endif
+          auto v = Ready.begin();
+          // Select operation with the highest height (smallest ALAP)
+          // if more than one, choose node with lowest mobility
+          for(auto I=v, E=Ready.end(); I != E; I++) {
+            unsigned tV = ALAPtimes[*v],
+                     tI = ALAPtimes[*I],
+                     mV = tV - ASAPtimes[*v],
+                     mI = tI - ASAPtimes[*I];
+
+            if(tV > tI || (tV == tI && mV > mI) ) v = I;
+          }
+          DEBUG(dbgs() << "LP: Adding ordered operation"; (*v)->dump());
+          OrderedNodes.push_back(*v);
+          AlreadyOrdered[*v] = true;
+
+          // Update R as R := R - {v} \union (Pred(v) \intersect S)
+          for(auto I : *CurrentPrioritySet) {
+            if(AlreadyOrdered[I])
+              continue;
+
+            for(auto U : (*v)->users()) {
+              Instruction *II = dyn_cast<Instruction>(U);
+              if(!II) continue;
+
+              bool alreadyReady = false;
+              for(auto III : Ready)
+                if( III == I ) alreadyReady = true;
+
+              if( !alreadyReady && I == II )
+                Ready.push_back(I);
+            }
+          }
+
+          // Update PredecessorListO and SuccessorListO
+          SuccessorListO.erase(*v);
+          PredecessorListO.erase(*v);
+          for(auto I : OrderedNodes) {
+            for(auto &O : I->operands()) {
+              Instruction *II = dyn_cast<Instruction>(O);
+              if(!II) continue;
+
+              if( II->getParent() == LoopBody && !AlreadyOrdered[II])
+                PredecessorListO.insert(II);
+            }
+
+            for(auto U : I->users()) {
+              Instruction *II = dyn_cast<Instruction>(U);
+              if(!II) continue;
+
+              if( II->getParent() == LoopBody && !AlreadyOrdered[II])
+                SuccessorListO.insert(II);
+            }
+          }
+
+          Ready.erase(v);
+        }
+
+        // add intersection of pred_L(O) with S to R
+        for(auto I : PredecessorListO)
+          for(auto II : *CurrentPrioritySet)
+            if(I == II && !AlreadyOrdered[I])
+              Ready.push_back(I);
+
+        order = BottomUp;
+      } else {
+        DEBUG(dbgs() << "^\n");
+        // Bottom-up ordering
+        while(!Ready.empty()) {
+#if 0
+          DEBUG(dbgs() << "LP: Ordering with ready list:\n"; for(auto I : Ready) I->dump());
+#endif
+          auto v = Ready.begin();
+          // Select operation with the highest depth (heighest ASAP)
+          // if more than one, choose node with lowest mobility
+          for(auto I=v, E=Ready.end(); I != E; I++) {
+            unsigned tV = ASAPtimes[*v],
+                     tI = ASAPtimes[*I],
+                     mV = ALAPtimes[*v] - tV,
+                     mI = ALAPtimes[*I] - tI;
+
+            if(tV < tI || (tV == tI && mV > mI) ) v = I;
+          }
+          DEBUG(dbgs() << "LP: Adding ordered operation"; (*v)->dump());
+          OrderedNodes.push_back(*v);
+          AlreadyOrdered[*v] = true;
+
+          // Update R as R := R - {v} \union (Suc(v) \intersect S)
+          for(auto I : *CurrentPrioritySet) {
+            if(AlreadyOrdered[I])
+              continue;
+
+            for(auto &O : (*v)->operands()) {
+              Instruction *II = dyn_cast<Instruction>(O);
+              if(!II) continue;
+
+              bool alreadyReady = false;
+              for(auto III : Ready)
+                if( III == I ) alreadyReady = true;
+
+              if( !alreadyReady && I == II )
+                Ready.push_back(I);
+            }
+          }
+
+          // Update PredecessorListO and SuccessorListO
+          SuccessorListO.erase(*v);
+          PredecessorListO.erase(*v);
+          for(auto I : OrderedNodes) {
+            for(auto &O : I->operands()) {
+              Instruction *II = dyn_cast<Instruction>(O);
+              if(!II) continue;
+
+              if( II->getParent() == LoopBody && !AlreadyOrdered[II])
+                PredecessorListO.insert(II);
+            }
+
+            for(auto U : I->users()) {
+              Instruction *II = dyn_cast<Instruction>(U);
+              if(!II) continue;
+
+              if( II->getParent() == LoopBody && !AlreadyOrdered[II])
+                SuccessorListO.insert(II);
+            }
+          }
+          Ready.erase(v);
+        }
+        // add intersection of suc_L(O) with S to R
+        for(auto I : SuccessorListO)
+          for(auto II : *CurrentPrioritySet)
+            if(I == II && !AlreadyOrdered[I])
+              Ready.push_back(I);
+
+        order = TopDown;
+      }
+    }
+#if 0
+    DEBUG(dbgs() << "LP: Intermediate ordering:\n"; for(auto I : OrderedNodes) I->dump());
+    DEBUG(dbgs() << "LP: New predecessor list:\n"; for(auto I : PredecessorListO) I->dump());
+    DEBUG(dbgs() << "LP: New successor list:\n"; for(auto I : SuccessorListO) I->dump());
+#endif
+
+    delete CurrentPrioritySet;
+  }
+
+  DEBUG(dbgs() << "LP: Node scheduling order\n");
+  for(auto I : OrderedNodes) {
+    DEBUG(I->dump());
+  }
+
+  assert(PredecessorListO.empty() && "Missed some nodes...");
+  assert(SuccessorListO.empty() && "Missed some nodes...");
 
   // Schedule
   // Generate new inner loop
