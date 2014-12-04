@@ -997,9 +997,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           for( ; ScheduleAt <= LateStart; ScheduleAt++) {
             bool ResourceAvailable;
             if(isVectorOperation)
-              ResourceAvailable = VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
+              ResourceAvailable = !VectorFUCount ? true : VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
             else
-              ResourceAvailable = ScalarSlotsUsed[ScheduleAt % II] < ScalarFUCount;
+              ResourceAvailable = !ScalarFUCount ? true : ScalarSlotsUsed[ScheduleAt % II] < ScalarFUCount;
             if(ResourceAvailable) break;
           }
 
@@ -1018,9 +1018,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           for( ; ScheduleAt <= EarlyStart; ScheduleAt--) {
             bool ResourceAvailable;
             if(isVectorOperation)
-              ResourceAvailable = VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
+              ResourceAvailable = !VectorFUCount ? true : VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
             else
-              ResourceAvailable = ScalarSlotsUsed[ScheduleAt % II] < ScalarFUCount;
+              ResourceAvailable = !ScalarFUCount ? true : ScalarSlotsUsed[ScheduleAt % II] < ScalarFUCount;
             if(ResourceAvailable) break;
           }
 
