@@ -909,10 +909,157 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   assert(SuccessorListO.empty() && "Missed some nodes...");
 
   // Schedule
-  // TODO schedule!!!
+  DenseMap<Instruction *, unsigned> ScheduledNodes;
+  DenseMap<Instruction *, bool> AlreadyScheduled;
+
+  // Resource information
+  const unsigned ScalarFUCount = TTI->getScalarFunctionUnitCount();
+  const unsigned VectorFUCount = TTI->getVectorFunctionUnitCount();
+
+  // Retry with higher MII until either a schedule was found or the schedule
+  // is no-longer a pipelined schedule
+  unsigned II = MII;
+  bool SchedulingDone = false;
+  bool ScheduleHasFold = true;
+  for( ; !SchedulingDone && ScheduleHasFold; II++) {
+    DEBUG(dbgs() << "LP: Scheduling with II=" << II << "\n");
+
+    // Resource allocation tables
+    std::vector<unsigned> ScalarSlotsUsed;
+    std::vector<unsigned> VectorSlotsUsed;
+
+    // Initialize resource allocation
+    ScalarSlotsUsed.resize(II, 0);
+    VectorSlotsUsed.resize(II, 0);
+
+    // Clear previous scheduling results
+    ScheduledNodes.clear();
+    AlreadyScheduled.clear();
+
+    // Assume that scheduling will work this time (unset on failure)
+    SchedulingDone = true;
+    ScheduleHasFold = false;
+
+    enum {Up = 0, Down} ScheduleDirection;
+
+    // Schedule nodes using the previously obtained order
+    for(auto I : OrderedNodes) {
+      unsigned EarlyStart = ASAPtimes[I],
+               LateStart = LastOperationStart + II - 1;
+
+      // Default scheduling direction
+      ScheduleDirection = Down;
+
+      // if successors in scheduled nodes
+      //  -> Update LateStart accordingly
+      for(auto U : I->users() ) {
+        Instruction *II = dyn_cast<Instruction>(U);
+        // TODO test for back-edges...
+        if(II && AlreadyScheduled[II]) {
+          LateStart = std::min(LateStart, ScheduledNodes[II] - getInstructionCost(I, TTI));
+          ScheduleDirection = Up;
+        }
+      }
+
+      // if predecessors in scheduled nodes
+      //  -> Update EarlyStart accordingly
+      for(auto &O : I->operands() ) {
+        Instruction *II = dyn_cast<Instruction>(O);
+        // TODO test for back-edges...
+        if(II && AlreadyScheduled[II]) {
+          EarlyStart = std::max(EarlyStart, ScheduledNodes[II] + getInstructionCost(II, TTI));
+          ScheduleDirection = Down;
+        }
+      }
+
+      // Compute schedule range (EarlyStart has already been set)
+      LateStart = std::min(LateStart, EarlyStart + II - 1);
+      DEBUG(dbgs() << "LP: Scheduling in range [" << EarlyStart << ", " << LateStart << "]:"; I->dump());
+
+      // Unschedulable window found
+      if(LateStart + getInstructionCost(I, TTI) < EarlyStart) {
+        SchedulingDone = false;
+        break;
+      }
+
+      // Classify operation type, distinguish between Vector, Scalar, and Free operations
+      bool isVectorOperation = isa<ExtractElementInst>(I) || I->getType()->isVectorTy();
+      bool isFreeOperation = getInstructionCost(I, TTI) == 0;
+
+      // Find free slot for scheduling
+      unsigned ScheduleAt;
+      if(ScheduleDirection == Down) {
+        ScheduleAt = EarlyStart;
+
+        // Check resource availability
+        // TODO make this optional to enable comparison to previous work
+        if(!isFreeOperation) {
+          for( ; ScheduleAt <= LateStart; ScheduleAt++) {
+            bool ResourceAvailable;
+            if(isVectorOperation)
+              ResourceAvailable = VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
+            else
+              ResourceAvailable = ScalarSlotsUsed[ScheduleAt % II] < ScalarFUCount;
+            if(ResourceAvailable) break;
+          }
+
+          // Fail if no free slot is found (and unset SchedulingDone)
+          if(ScheduleAt > LateStart) {
+            SchedulingDone = false;
+            break;
+          }
+        }
+      } else {
+        ScheduleAt = LateStart;
+
+        // Check resource availability
+        // TODO make this optional to enable comparison to previous work
+        if(!isFreeOperation) {
+          for( ; ScheduleAt <= EarlyStart; ScheduleAt--) {
+            bool ResourceAvailable;
+            if(isVectorOperation)
+              ResourceAvailable = VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
+            else
+              ResourceAvailable = ScalarSlotsUsed[ScheduleAt % II] < ScalarFUCount;
+            if(ResourceAvailable) break;
+          }
+
+          // Fail if no free slot is found (and unset SchedulingDone)
+          if(ScheduleAt < EarlyStart) {
+            SchedulingDone = false;
+            break;
+          }
+        }
+      }
+      DEBUG(dbgs() << "LP: Scheduling at " << ScheduleAt << ":"; I->dump());
+      ScheduledNodes[I] = ScheduleAt;
+      if(!isFreeOperation) {
+        if(isVectorOperation)
+          VectorSlotsUsed[ScheduleAt % II]++;
+        else
+          ScalarSlotsUsed[ScheduleAt % II]++;
+      }
+
+      // Check if schedule is still a modulo schedule that spans multiple iterations
+      if(ScheduleAt >= II) {
+        ScheduleHasFold = true;
+      }
+    }
+  }
+  // Undo last increment of for loop
+  II--;
+
+  // Check if schedule is still a modulo schedule that spans multiple iterations
+  if( !ScheduleHasFold ) {
+    DEBUG(dbgs() << "LP: Pipelined schedule has no benefit over non-pipelined version\n");
+    return false;
+  }
+
+  DEBUG(dbgs() << "LP: Found schedule with II of " << II << '\n');
 
   // Generate new inner loop
   // Construct prologue/epilogue
+  // TODO finish...
 
   // Done
   LoopsPipelined++;
