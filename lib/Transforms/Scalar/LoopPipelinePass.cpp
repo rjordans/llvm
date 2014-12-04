@@ -29,6 +29,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
@@ -41,6 +42,10 @@ using namespace llvm;
 
 STATISTIC(LoopsAnalyzed, "Number of loops analyzed for high-level software pipelining");
 STATISTIC(LoopsPipelined, "Number of loops pipelined");
+
+static cl::opt<bool> IgnoreResourceConstraints("pipeline-ignore-resource-constraint",
+    cl::init(false), cl::Hidden,
+    cl::desc("Ignore resource constraints during high-level software pipelining"));
 
 //***************************************************************************
 // Pass registration and work list construction
@@ -394,14 +399,13 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, CycleSet &cycles) {
 // - No constraint for the number of parallel memory accesses for loops with
 //   high memory bandwidth
 //
-// TODO:
-// Make this conditional to observe the effect of adding resource constraints
-// versus the approach taken in Ben-Asher & Meisler
 unsigned LoopPipeline::computeResourceMII(CodeMetrics &CM) {
   unsigned ResMII = 0;
   unsigned NumScalarInsts = CM.NumInsts - CM.NumVectorInsts;
   const unsigned ScalarFUCount = TTI->getScalarFunctionUnitCount();
   const unsigned VectorFUCount = TTI->getVectorFunctionUnitCount();
+
+  if(IgnoreResourceConstraints) return 0;
 
   DEBUG(dbgs() << "LP: NumInsts=" << CM.NumInsts
         << ", NumVectorInsts=" << CM.NumVectorInsts << '\n');
@@ -992,8 +996,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         ScheduleAt = EarlyStart;
 
         // Check resource availability
-        // TODO make this optional to enable comparison to previous work
-        if(!isFreeOperation) {
+        if(!isFreeOperation && !IgnoreResourceConstraints) {
           for( ; ScheduleAt <= LateStart; ScheduleAt++) {
             bool ResourceAvailable;
             if(isVectorOperation)
@@ -1013,8 +1016,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         ScheduleAt = LateStart;
 
         // Check resource availability
-        // TODO make this optional to enable comparison to previous work
-        if(!isFreeOperation) {
+        if(!isFreeOperation && !IgnoreResourceConstraints) {
           for( ; ScheduleAt <= EarlyStart; ScheduleAt--) {
             bool ResourceAvailable;
             if(isVectorOperation)
