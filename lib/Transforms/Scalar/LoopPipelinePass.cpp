@@ -15,6 +15,12 @@
 //     Ben-Asher and Meisler,
 //     Program Analysis and Compilation, Theory and Practice
 //
+// and,
+//
+//     Swing Modulo Scheduling: A Lifetime-Sensitive Approach
+//     Josep Llosa, Antonio Gonzalez, Eduard Ayguade, and Mateo Valero
+//     Working Conference on Parallel Architectures and Compilation Techniques
+//
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/DenseMap.h"
@@ -43,7 +49,15 @@ using namespace llvm;
 STATISTIC(LoopsAnalyzed, "Number of loops analyzed for high-level software pipelining");
 STATISTIC(LoopsPipelined, "Number of loops pipelined");
 
-static cl::opt<bool> IgnoreResourceConstraints("pipeline-ignore-resource-constraint",
+// FIXME:
+// This is dependant on support in the back-end scheduler which is currently missing in the
+// generic scheduler.  We should probably use a target hook for this information in stead of
+// a user option.
+static cl::opt<bool> AllowMultiIterationOperations("pipeline-allow-multi-iteration-ops",
+	cl::init(false), cl::Hidden,
+	cl::desc("Allow operations to cross over multiple itteration bounds"));
+
+static cl::opt<bool> IgnoreResourceConstraints("pipeline-ignore-resources",
     cl::init(false), cl::Hidden,
     cl::desc("Ignore resource constraints during high-level software pipelining"));
 
@@ -631,6 +645,21 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   // Compute ALAP times for all operations in the loop body in reverse
   scheduleALAP(LoopBody, LastOperationStart, ALAPtimes);
 
+  // FIXME: This test should be done during scheduling to provide more accuracy
+  //  so that scheduling an operation early in the first II cycles and late in
+  //  the next II cycles is possible
+  if(!AllowMultiIterationOperations) {
+	unsigned MaxInstructionCost = 0;
+	for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
+	  MaxInstructionCost = std::max(MaxInstructionCost, getInstructionCost(I, TTI));
+	}
+
+	if(MII < MaxInstructionCost) {
+	  DEBUG(dbgs() << "LP: MII is less than maximum instruction latency, increasing MII to avoid operations that span more than two itterations\n");
+	  MII = MaxInstructionCost;
+	}
+  }
+
 #if 1
   // Debug print computed values
   DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost, Depth, Height)\n  S L M D H C\n");
@@ -904,10 +933,12 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     delete CurrentPrioritySet;
   }
 
+#if 0
   DEBUG(dbgs() << "LP: Node scheduling order\n");
   for(auto I : OrderedNodes) {
     DEBUG(I->dump());
   }
+#endif
 
   assert(PredecessorListO.empty() && "Missed some nodes...");
   assert(SuccessorListO.empty() && "Missed some nodes...");
@@ -958,7 +989,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       //  -> Update LateStart accordingly
       for(auto U : I->users() ) {
         Instruction *II = dyn_cast<Instruction>(U);
-        // TODO test for back-edges...
+        // TODO test for back-edges?
         if(II && AlreadyScheduled[II]) {
           LateStart = std::min(LateStart, ScheduledNodes[II] - getInstructionCost(I, TTI));
           ScheduleDirection = Up;
@@ -969,7 +1000,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       //  -> Update EarlyStart accordingly
       for(auto &O : I->operands() ) {
         Instruction *II = dyn_cast<Instruction>(O);
-        // TODO test for back-edges...
+        // TODO test for back-edges?
         if(II && AlreadyScheduled[II]) {
           EarlyStart = std::max(EarlyStart, ScheduledNodes[II] + getInstructionCost(II, TTI));
           ScheduleDirection = Down;
@@ -978,7 +1009,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
       // Compute schedule range (EarlyStart has already been set)
       LateStart = std::min(LateStart, EarlyStart + II - 1);
+#if 0
       DEBUG(dbgs() << "LP: Scheduling in range [" << EarlyStart << ", " << LateStart << "]:"; I->dump());
+#endif
 
       // Unschedulable window found
       if(LateStart + getInstructionCost(I, TTI) < EarlyStart) {
