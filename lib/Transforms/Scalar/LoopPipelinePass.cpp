@@ -645,21 +645,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   // Compute ALAP times for all operations in the loop body in reverse
   scheduleALAP(LoopBody, LastOperationStart, ALAPtimes);
 
-  // FIXME: This test should be done during scheduling to provide more accuracy
-  //  so that scheduling an operation early in the first II cycles and late in
-  //  the next II cycles is possible
-  if(!AllowMultiIterationOperations) {
-	unsigned MaxInstructionCost = 0;
-	for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
-	  MaxInstructionCost = std::max(MaxInstructionCost, getInstructionCost(I, TTI));
-	}
-
-	if(MII < MaxInstructionCost) {
-	  DEBUG(dbgs() << "LP: MII is less than maximum instruction latency, increasing MII to avoid operations that span more than two itterations\n");
-	  MII = MaxInstructionCost;
-	}
-  }
-
 #if 1
   // Debug print computed values
   DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost, Depth, Height)\n  S L M D H C\n");
@@ -955,8 +940,8 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   // is no-longer a pipelined schedule
   unsigned II = MII;
   bool SchedulingDone = false;
-  bool ScheduleHasFold = true;
-  for( ; !SchedulingDone && ScheduleHasFold; II++) {
+  bool ScheduleHasFold;
+  for( ; !SchedulingDone; II++) {
     DEBUG(dbgs() << "LP: Scheduling with II=" << II << "\n");
 
     // Resource allocation tables
@@ -1032,6 +1017,13 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         if(!isFreeOperation && !IgnoreResourceConstraints) {
           for( ; ScheduleAt <= LateStart; ScheduleAt++) {
             bool ResourceAvailable;
+
+            // Skip time slots for which the current operation would cross multiple iteration bounds
+            if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
+              DEBUG(dbgs() << "LP: Failed: Could not fold operation over more than one itteration\n");
+              continue;
+            }
+
             if(isVectorOperation)
               ResourceAvailable = !VectorFUCount ? true : VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
             else
@@ -1052,6 +1044,11 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         if(!isFreeOperation && !IgnoreResourceConstraints) {
           for( ; ScheduleAt <= EarlyStart; ScheduleAt--) {
             bool ResourceAvailable;
+
+            // Skip time slots for which the current operation would cross multiple iteration bounds
+            if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1)
+              continue;
+
             if(isVectorOperation)
               ResourceAvailable = !VectorFUCount ? true : VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
             else
