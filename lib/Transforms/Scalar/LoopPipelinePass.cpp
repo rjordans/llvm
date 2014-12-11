@@ -54,8 +54,8 @@ STATISTIC(LoopsPipelined, "Number of loops pipelined");
 // generic scheduler.  We should probably use a target hook for this information in stead of
 // a user option.
 static cl::opt<bool> AllowMultiIterationOperations("pipeline-allow-multi-iteration-ops",
-	cl::init(false), cl::Hidden,
-	cl::desc("Allow operations to cross over multiple itteration bounds"));
+    cl::init(false), cl::Hidden,
+    cl::desc("Allow operations to cross over multiple itteration bounds"));
 
 static cl::opt<bool> IgnoreResourceConstraints("pipeline-ignore-resources",
     cl::init(false), cl::Hidden,
@@ -145,10 +145,10 @@ namespace {
 
       // Find
       const Instruction *find(Instruction *I) const {
-		for(auto II=trace.begin(), E=trace.end(); II != E; II++)
-		  if( *II == I )
-			return *II;
-		return nullptr;
+        for(auto II=trace.begin(), E=trace.end(); II != E; II++)
+          if( *II == I )
+            return *II;
+        return nullptr;
       }
 
       // Compare for insertion into set
@@ -341,7 +341,7 @@ void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
                          CycleSet &cycles) {
   // stay within the loop body
   if( I->getParent() != Phi->getParent() )
-	return;
+    return;
 
   // found a cycle when we end up at our start point
   if( I == Phi && trace.size() != 0 ) {
@@ -360,7 +360,7 @@ void LoopPipeline::getPhiCycles(Instruction *I, const PHINode *Phi,
   // instruction.  Don't add original Phi node until the cycle is completed
   // to preserve (reversed) ordering.
   if( I != Phi )
-	trace.add(I, TTI);
+    trace.add(I, TTI);
 
   if( isa<PHINode>(I) ) {
     PHINode *P = cast<PHINode>(I);
