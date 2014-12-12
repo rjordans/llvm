@@ -1005,7 +1005,8 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       }
 
       // Classify operation type, distinguish between Vector, Scalar, and Free operations
-      bool isVectorOperation = isa<ExtractElementInst>(I) || I->getType()->isVectorTy();
+      // Also count vector operations as scalar operations when no separate vector units are available
+      bool isVectorOperation = VectorFUCount != 0 && (isa<ExtractElementInst>(I) || I->getType()->isVectorTy());
       bool isFreeOperation = getInstructionCost(I, TTI) == 0;
 
       // Find free slot for scheduling
