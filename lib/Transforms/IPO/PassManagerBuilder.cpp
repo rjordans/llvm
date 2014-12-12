@@ -252,11 +252,6 @@ void PassManagerBuilder::populateModulePassManager(PassManagerBase &MPM) {
   if (LoadCombine)
     MPM.add(createLoadCombinePass());
 
-#ifndef TARGET_IS_NOT_SHAVE
-  if (LoopPipeline)
-    MPM.add(createLoopPipelinePass());    // Software-pipeline loops
-#endif
-
   MPM.add(createAggressiveDCEPass());         // Delete dead instructions
   MPM.add(createCFGSimplificationPass()); // Merge & remove BBs
   MPM.add(createInstructionCombiningPass());  // Clean up after everything.
@@ -278,6 +273,11 @@ void PassManagerBuilder::populateModulePassManager(PassManagerBase &MPM) {
 
   if (!DisableUnrollLoops)
     MPM.add(createLoopUnrollPass());    // Unroll small loops
+
+#ifndef TARGET_IS_NOT_SHAVE
+  if (LoopPipeline)
+    MPM.add(createLoopPipelinePass());    // Software-pipeline loops
+#endif
 
   if (!DisableUnitAtATime) {
     // FIXME: We shouldn't bother with this anymore.
