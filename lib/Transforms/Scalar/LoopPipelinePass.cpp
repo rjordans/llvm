@@ -1021,7 +1021,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
             if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
-              DEBUG(dbgs() << "LP: Failed: Could not fold operation over more than one itteration\n");
+              DEBUG(dbgs() << "LP: Failed: Could not fold operation over more than one iteration\n");
               continue;
             }
 
@@ -1047,8 +1047,10 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
             bool ResourceAvailable;
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
-            if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1)
+            if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
+              DEBUG(dbgs() << "LP: Failed: Could not fold operation over more than one iteration\n");
               continue;
+            }
 
             if(isVectorOperation)
               ResourceAvailable = !VectorFUCount ? true : VectorSlotsUsed[ScheduleAt % II] < VectorFUCount;
