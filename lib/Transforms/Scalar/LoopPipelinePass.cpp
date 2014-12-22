@@ -1102,9 +1102,119 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
   DEBUG(dbgs() << "LP: Found schedule with II of " << II << '\n');
 
+  // FIXME: Fixup free operations to be as close as possible to their first consumer
+  // Doesn't work yet, cycles need to be kept together...  Maybe fix this in the actual scheduling above?
+#if 0
+  // Pull down zero-cost operations
+  for(auto rI=LoopBody->rbegin(), E=LoopBody->rend(); rI != E; rI++) {
+    Instruction *I = rI.base();
+    bool ShouldReschedule = false;
+    if(getInstructionCost(I, TTI) == 0) {
+      unsigned LatestStart = LoopLatency;
+      for(auto U : I->users()) {
+        Instruction *II = dyn_cast<Instruction>(U);
+        if(II && !isa<PHINode>(II) && ScheduledNodes[II] < LatestStart) {
+          ShouldReschedule = true;
+          LatestStart = ScheduledNodes[II];
+        }
+      }
+      if(ShouldReschedule)
+        ScheduledNodes[I] = LatestStart;
+    }
+  }
+#endif
+
+  DEBUG(dbgs() << "LP: Schedule with latency "<< LoopLatency << "\n");
+  for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
+    DEBUG(dbgs() << "  c" << ScheduledNodes[I]; I->dump());
+  }
+
+  // Compute number of overlapping kernels to determine block count for prologue/epilogue
+  const unsigned NumberOfInterleavedItterations = LoopLatency / II + 1;
+  DEBUG(dbgs() << "LP: Interleaving " << NumberOfInterleavedItterations << " loop iterations\n");
+
   // Generate new inner loop
   // Construct prologue/epilogue
+  BasicBlock *Prologue = L->getLoopPreheader();
+  BasicBlock *Epilogue = L->getExitBlock();
+
+  if(!Prologue || !Epilogue) {
+    DEBUG(dbgs() << "LP: Failed to create loop preheader or exit block for prologue and epilogue creation\n");
+    return false;
+  }
+
+  DEBUG(dbgs() << "LP: Prologue name '" << Prologue->getName() << "'\n");
+  DEBUG(dbgs() << "LP: Epilogue name '" << Epilogue->getName() << "'\n");
+
   // TODO finish...
+  // Construct worklists
+  SmallVector<SmallVectorImpl<Instruction*>*,4> worklists;
+  for(unsigned interval = 0; interval < NumberOfInterleavedItterations; interval++) {
+    // Construct worklist for each interval
+    SmallVectorImpl<Instruction*> *worklist = new SmallVector<Instruction *, 8>();
+
+    for( auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
+      if( (ScheduledNodes[I] / II) == interval )
+        worklist->push_back(I);
+    }
+    worklists.push_back(worklist);
+  }
+
+#if 0
+  unsigned interval = 0;
+  for(auto worklist : worklists) {
+    DEBUG(dbgs() << "Operations to schedule for interval " << interval << "\n");
+    for(auto op : *worklist) {
+      DEBUG(op->dump());
+    }
+    interval++;
+  }
+#endif
+
+  DEBUG(dbgs() << "LP: Prologue\n");
+  for(unsigned interval = 0; interval < NumberOfInterleavedItterations-1; interval++) {
+    DEBUG(dbgs() << " Operations to schedule for stage " << interval << "\n");
+    for(unsigned block = interval+1; block;) {
+      for(auto op : *worklists[--block]) {
+        DEBUG(op->dump());
+      }
+    }
+  }
+
+  DEBUG(dbgs() << "LP: Kernel\n");
+  for(unsigned block = NumberOfInterleavedItterations; block;) {
+    for(auto op : *worklists[--block]) {
+      DEBUG(op->dump());
+    }
+  }
+
+  DEBUG(dbgs() << "LP: Epilogue\n");
+  for(unsigned interval = 1; interval < NumberOfInterleavedItterations ; interval++) {
+    DEBUG(dbgs() << " Operations to schedule for stage " << (interval-1) << "\n");
+    for(unsigned block = interval; block < NumberOfInterleavedItterations; block++) {
+      for(auto op : *worklists[block]) {
+        DEBUG(op->dump());
+      }
+    }
+  }
+
+
+  // Use split block to extend number of blocks in prologue/epilogue
+
+  // Construct prologue
+  // Find operations for first II cycles of schedule
+  // Fix connections for Phi nodes
+  // Insert operations into prologue
+
+  // Clean-up worklists
+  for(auto worklist : worklists) {
+    delete worklist;
+  }
+
+  // Invalidate old loop in SCEV cache
+  SE->forgetLoop(L);
+
+  // Cleanup: DCE, CSE, ...
 
   // Done
   LoopsPipelined++;
