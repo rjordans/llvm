@@ -941,6 +941,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   unsigned II = MII;
   bool SchedulingDone = false;
   bool ScheduleHasFold;
+  unsigned LoopLatency = 0;
   for( ; !SchedulingDone; II++) {
     DEBUG(dbgs() << "LP: Scheduling with II=" << II << "\n");
 
@@ -1074,6 +1075,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         else
           ScalarSlotsUsed[ScheduleAt % II]++;
       }
+
+      // Keep track of loop latency (last operation start)
+      LoopLatency = std::max(LoopLatency, ScheduleAt);
 
       // Check if schedule is still a modulo schedule that spans multiple iterations
       if(ScheduleAt >= II) {
