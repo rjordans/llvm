@@ -610,7 +610,7 @@ bool LoopPipeline::getConnectingNodes(Instruction *I,
     // search upwards
     for(auto &O : I->operands() ) {
       Instruction *II = dyn_cast<Instruction>(O);
-      if(II) 
+      if(II)
         found |= getConnectingNodes(II, B, VisitedNodes, connectingNodes, direction);
     }
   } else {
