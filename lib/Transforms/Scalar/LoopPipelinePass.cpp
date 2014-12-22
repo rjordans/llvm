@@ -1022,7 +1022,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
             if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
-              DEBUG(dbgs() << "LP: Failed: Could not fold operation over more than one iteration\n");
+              DEBUG(dbgs() << "LP: Could not fold operation over more than one iteration\n");
               continue;
             }
 
@@ -1049,7 +1049,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
             if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
-              DEBUG(dbgs() << "LP: Failed: Could not fold operation over more than one iteration\n");
+              DEBUG(dbgs() << "LP: Could not fold operation over more than one iteration\n");
               continue;
             }
 
@@ -1067,7 +1067,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           }
         }
       }
+#if 0
       DEBUG(dbgs() << "LP: Scheduling at " << ScheduleAt << ":"; I->dump());
+#endif
       ScheduledNodes[I] = ScheduleAt;
       if(!isFreeOperation) {
         if(isVectorOperation)
@@ -1083,6 +1085,10 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       if(ScheduleAt >= II) {
         ScheduleHasFold = true;
       }
+    }
+
+    if(!SchedulingDone) {
+      DEBUG(dbgs() << "LP: Failed to find a schedule with II=" << II << '\n');
     }
   }
   // Undo last increment of for loop
