@@ -28,17 +28,22 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <set>
 
@@ -48,14 +53,6 @@ using namespace llvm;
 
 STATISTIC(LoopsAnalyzed, "Number of loops analyzed for high-level software pipelining");
 STATISTIC(LoopsPipelined, "Number of loops pipelined");
-
-// FIXME:
-// This is dependant on support in the back-end scheduler which is currently missing in the
-// generic scheduler.  We should probably use a target hook for this information in stead of
-// a user option.
-static cl::opt<bool> AllowMultiIterationOperations("pipeline-allow-multi-iteration-ops",
-    cl::init(false), cl::Hidden,
-    cl::desc("Allow operations to cross over multiple itteration bounds"));
 
 static cl::opt<bool> IgnoreResourceConstraints("pipeline-ignore-resources",
     cl::init(false), cl::Hidden,
@@ -88,6 +85,11 @@ namespace {
       LI = &getAnalysis<LoopInfo>();
       SE = &getAnalysis<ScalarEvolution>();
       TTI = &getAnalysis<TargetTransformInfo>();
+      TLI = &getAnalysis<TargetLibraryInfo>();
+
+      DataLayoutPass *DLP = getAnalysisIfAvailable<DataLayoutPass>();
+      DL = DLP ? &DLP->getDataLayout() : nullptr;
+
 
       DEBUG(dbgs() << "\nLP: Hello from loop-pipeline: ";
             dbgs().write_escaped(F.getName()) << '\n');
@@ -113,13 +115,16 @@ namespace {
       AU.addRequired<LoopInfo>();
       AU.addRequired<ScalarEvolution>();
       AU.addRequired<TargetTransformInfo>();
+      AU.addRequired<TargetLibraryInfo>();
     }
 
   private:
+    const DataLayout *DL;
     DependenceAnalysis *DA;
     LoopInfo *LI;
     ScalarEvolution *SE;
     TargetTransformInfo *TTI;
+    TargetLibraryInfo *TLI;
 
     class InstructionTrace {
     public:
@@ -184,7 +189,14 @@ namespace {
 }
 
 char LoopPipeline::ID = 0;
-INITIALIZE_PASS(LoopPipeline, "loop-pipeline",
+INITIALIZE_PASS_BEGIN(LoopPipeline, "loop-pipeline",
+                "Software pipeline inner-loops", false, false)
+INITIALIZE_PASS_DEPENDENCY(DependenceAnalysis)
+INITIALIZE_PASS_DEPENDENCY(LoopInfo)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfo)
+INITIALIZE_AG_DEPENDENCY(TargetTransformInfo)
+INITIALIZE_PASS_END(LoopPipeline, "loop-pipeline",
                 "Software pipeline inner-loops", false, false)
 
 FunctionPass *llvm::createLoopPipelinePass() {
@@ -521,7 +533,7 @@ static unsigned getInstructionCost(const Instruction *I, const TargetTransformIn
   }
   case Instruction::Load: {
     const LoadInst *LI = cast<LoadInst>(I);
-    return TTI->getMemoryOpCost(I->getOpcode(), I->getType(),
+    return 3 + TTI->getMemoryOpCost(I->getOpcode(), I->getType(),
                                 LI->getAlignment(),
                                 LI->getPointerAddressSpace());
   }
@@ -636,37 +648,12 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   DEBUG(dbgs() << "LP: Software pipelining loop with MII=" << MII << '\n');
   BasicBlock *LoopBody = L->getBlocks()[0];
 
-  PartialSchedule ASAPtimes;
-  PartialSchedule ALAPtimes;
-
-  // Compute ASAP times for all operations in the loop body
-  unsigned LastOperationStart = scheduleASAP(LoopBody, ASAPtimes);
-
-  // Compute ALAP times for all operations in the loop body in reverse
-  scheduleALAP(LoopBody, LastOperationStart, ALAPtimes);
-
-#if 1
-  // Debug print computed values
-  DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost, Depth, Height)\n  S L M D H C\n");
-  for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
-    unsigned ASAP     = ASAPtimes[I],
-             ALAP     = ALAPtimes[I],
-             Mobility = ALAP - ASAP,
-             Depth    = ASAP,
-             Height   = LastOperationStart - ALAP,
-             Cost     = getInstructionCost(I, TTI);
-
-    DEBUG(
-      dbgs() << "  " << ASAP << " " << ALAP << " " << Mobility << " " << Depth << " " << Height << " " << Cost;
-      I->dump()
-         );
-  }
-#endif
-
-  // Construct priority sets based on the recurrences found earlier sorted by
-  // their weight.  Add all nodes on paths between a previous recurrence and
-  // the inserted one to avoid nodes which have both their ancestors and
-  // successors scheduled.
+  /*
+   * Construct priority sets based on the recurrences found earlier sorted by
+   * their weight.  Add all nodes on paths between a previous recurrence and
+   * the inserted one to avoid nodes which have both their ancestors and
+   * successors scheduled.
+   */
   SmallVector<SmallVectorImpl<Instruction *>*, 4> PrioritySets;
   SmallVector<unsigned, 4> PrioritySetWeights;
   DenseMap<Instruction *, bool>  VisitedNodes;
@@ -721,6 +708,15 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   }
   PrioritySetWeights.push_back(0);
   PrioritySets.push_back(AllNodesTrace);
+
+  PartialSchedule ASAPtimes;
+  PartialSchedule ALAPtimes;
+
+  // Compute ASAP times for all operations in the loop body
+  unsigned LastOperationStart = scheduleASAP(LoopBody, ASAPtimes);
+
+  // Compute ALAP times for all operations in the loop body in reverse
+  scheduleALAP(LoopBody, LastOperationStart, ALAPtimes);
 
   // Construct node ordering
   SmallVector<Instruction *, 16> OrderedNodes;
@@ -928,7 +924,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   assert(PredecessorListO.empty() && "Missed some nodes...");
   assert(SuccessorListO.empty() && "Missed some nodes...");
 
-  // Schedule
+  /*
+   * Schedule operations according to the prioritized ordering
+   */
   DenseMap<Instruction *, unsigned> ScheduledNodes;
   DenseMap<Instruction *, bool> AlreadyScheduled;
 
@@ -943,6 +941,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   bool ScheduleHasFold;
   unsigned LoopLatency = 0;
   for( ; !SchedulingDone; II++) {
+    // Abort scheduling when the II grows too much
+    if(LastOperationStart < II) break;
+
     DEBUG(dbgs() << "LP: Scheduling with II=" << II << "\n");
 
     // Resource allocation tables
@@ -963,6 +964,24 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
     enum {Up = 0, Down} ScheduleDirection;
 
+#if 1
+    // Debug print computed values
+    DEBUG(dbgs() << "LP: Schedule freedom (ASAP, ALAP, Mobility, Cost, Depth, Height)\n  S L M D H C\n");
+    for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
+      unsigned ASAP     = ASAPtimes[I],
+               ALAP     = ALAPtimes[I],
+               Mobility = ALAP - ASAP,
+               Depth    = ASAP,
+               Height   = LastOperationStart - ALAP,
+               Cost     = getInstructionCost(I, TTI);
+
+      DEBUG(
+        dbgs() << "  " << ASAP << " " << ALAP << " " << Mobility << " " << Depth << " " << Height << " " << Cost;
+        I->dump()
+           );
+    }
+#endif
+
     // Schedule nodes using the previously obtained order
     for(auto I : OrderedNodes) {
       unsigned EarlyStart = ASAPtimes[I],
@@ -974,10 +993,16 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       // if successors in scheduled nodes
       //  -> Update LateStart accordingly
       for(auto U : I->users() ) {
-        Instruction *II = dyn_cast<Instruction>(U);
-        // TODO test for back-edges?
-        if(II && AlreadyScheduled[II]) {
-          LateStart = std::min(LateStart, ScheduledNodes[II] - getInstructionCost(I, TTI));
+        Instruction *dep = dyn_cast<Instruction>(U);
+
+        if(dep && AlreadyScheduled[dep]) {
+          unsigned userStart;
+          if(isa<PHINode>(dep)) {
+            userStart = std::max(ScheduledNodes[dep] - getInstructionCost(I, TTI), II) - II;
+          } else {
+            userStart = ScheduledNodes[dep] - getInstructionCost(I, TTI);
+          }
+          LateStart = std::min(LateStart, userStart);
           ScheduleDirection = Up;
         }
       }
@@ -985,10 +1010,14 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       // if predecessors in scheduled nodes
       //  -> Update EarlyStart accordingly
       for(auto &O : I->operands() ) {
-        Instruction *II = dyn_cast<Instruction>(O);
-        // TODO test for back-edges?
-        if(II && AlreadyScheduled[II]) {
-          EarlyStart = std::max(EarlyStart, ScheduledNodes[II] + getInstructionCost(II, TTI));
+        Instruction *op = dyn_cast<Instruction>(O);
+
+        if(op && AlreadyScheduled[op]) {
+          unsigned operandFinish = ScheduledNodes[op]; + getInstructionCost(op, TTI);
+          if(isa<PHINode>(I)) {
+            operandFinish = std::min(operandFinish - II, operandFinish);
+          }
+          EarlyStart = std::max(EarlyStart, operandFinish);
           ScheduleDirection = Down;
         }
       }
@@ -1000,7 +1029,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 #endif
 
       // Unschedulable window found
-      if(LateStart + getInstructionCost(I, TTI) < EarlyStart) {
+      if(LateStart < EarlyStart) {
         SchedulingDone = false;
         break;
       }
@@ -1021,7 +1050,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
             bool ResourceAvailable;
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
-            if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
+            if(((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
               DEBUG(dbgs() << "LP: Could not fold operation over more than one iteration\n");
               continue;
             }
@@ -1048,7 +1077,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
             bool ResourceAvailable;
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
-            if(!AllowMultiIterationOperations && ((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
+            if(((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
               DEBUG(dbgs() << "LP: Could not fold operation over more than one iteration\n");
               continue;
             }
@@ -1071,6 +1100,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       DEBUG(dbgs() << "LP: Scheduling at " << ScheduleAt << ":"; I->dump());
 #endif
       ScheduledNodes[I] = ScheduleAt;
+      AlreadyScheduled[I] = true;
       if(!isFreeOperation) {
         if(isVectorOperation)
           VectorSlotsUsed[ScheduleAt % II]++;
@@ -1082,7 +1112,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       LoopLatency = std::max(LoopLatency, ScheduleAt);
 
       // Check if schedule is still a modulo schedule that spans multiple iterations
-      if(ScheduleAt >= II) {
+      if(ScheduleAt >= II && !isFreeOperation) {
         ScheduleHasFold = true;
       }
     }
@@ -1101,55 +1131,71 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   }
 
   DEBUG(dbgs() << "LP: Found schedule with II of " << II << '\n');
-
-  // FIXME: Fixup free operations to be as close as possible to their first consumer
-  // Doesn't work yet, cycles need to be kept together...  Maybe fix this in the actual scheduling above?
-#if 0
-  // Pull down zero-cost operations
-  for(auto rI=LoopBody->rbegin(), E=LoopBody->rend(); rI != E; rI++) {
-    Instruction *I = rI.base();
-    bool ShouldReschedule = false;
-    if(getInstructionCost(I, TTI) == 0) {
-      unsigned LatestStart = LoopLatency;
-      for(auto U : I->users()) {
-        Instruction *II = dyn_cast<Instruction>(U);
-        if(II && !isa<PHINode>(II) && ScheduledNodes[II] < LatestStart) {
-          ShouldReschedule = true;
-          LatestStart = ScheduledNodes[II];
-        }
-      }
-      if(ShouldReschedule)
-        ScheduledNodes[I] = LatestStart;
-    }
-  }
-#endif
-
   DEBUG(dbgs() << "LP: Schedule with latency "<< LoopLatency << "\n");
   for(auto I=LoopBody->begin(), E=LoopBody->end(); I != E; I++) {
     DEBUG(dbgs() << "  c" << ScheduledNodes[I]; I->dump());
   }
 
   // Compute number of overlapping kernels to determine block count for prologue/epilogue
-  const unsigned NumberOfInterleavedItterations = LoopLatency / II + 1;
-  DEBUG(dbgs() << "LP: Interleaving " << NumberOfInterleavedItterations << " loop iterations\n");
+  const unsigned NumberOfInterleavedIterations = LoopLatency / II + 1;
+  DEBUG(dbgs() << "LP: Interleaving " << NumberOfInterleavedIterations << " loop iterations\n");
 
-  // Generate new inner loop
-  // Construct prologue/epilogue
-  BasicBlock *Prologue = L->getLoopPreheader();
-  BasicBlock *Epilogue = L->getExitBlock();
+  /* Generate alternative inner loop and select pipelined alternative when there is sufficient data
 
-  if(!Prologue || !Epilogue) {
+               [  ] <------- back-edge taken count check
+                /\
+               /  \
+              /    v
+             /    [ ] <----- prologue
+            /      |
+            v      v
+   old --> [ ] \ [   ] \ <-- pipelined loop
+   loop    [ ]_| [   ]_|
+            \      |
+             \     v
+              \   [ ] <----- epilogue
+               \   /
+                \ /
+                 v
+                [ ] <------- exit block
+   ...
+   */
+  BasicBlock *OldPreheaderBlock = L->getLoopPreheader();
+  BasicBlock *OldExitBlock = L->getExitBlock();
+  Loop *ParentLoop = L->getParentLoop();
+
+  LLVMContext &C = OldPreheaderBlock->getContext();
+
+  if(!OldPreheaderBlock || !OldExitBlock) {
     DEBUG(dbgs() << "LP: Failed to create loop preheader or exit block for prologue and epilogue creation\n");
     return false;
   }
 
-  DEBUG(dbgs() << "LP: Prologue name '" << Prologue->getName() << "'\n");
-  DEBUG(dbgs() << "LP: Epilogue name '" << Epilogue->getName() << "'\n");
+  // Create a new loop structure for pipelined loop so that we can keep the original loop as a backup...
+  BasicBlock *Prologue = BasicBlock::Create(C, LoopBody->getName()+".lp.prologue", OldPreheaderBlock->getParent(), OldExitBlock);
+  TerminatorInst *PrologueTerm = BranchInst::Create(OldExitBlock, Prologue);
+  PrologueTerm->setDebugLoc(OldPreheaderBlock->getTerminator()->getDebugLoc());
 
-  // TODO finish...
+  BasicBlock *PipelinedBody = Prologue->splitBasicBlock(Prologue->getTerminator(), LoopBody->getName()+".lp.kernel");
+  BasicBlock *Epilogue = PipelinedBody->splitBasicBlock(PipelinedBody->getTerminator(), LoopBody->getName()+".lp.epilogue");
+
+  Loop *Lp = new Loop();
+  if(ParentLoop) {
+    ParentLoop->addChildLoop(Lp);
+    ParentLoop->addBasicBlockToLoop(Prologue, LI->getBase());
+    ParentLoop->addBasicBlockToLoop(Epilogue, LI->getBase());
+  } else {
+    LI->addTopLevelLoop(Lp);
+  }
+  Lp->addBasicBlockToLoop(PipelinedBody, LI->getBase());
+
+  // TODO split critical edges from OldPreheaderBlock when finished
+//  SplitCriticalEdge(LoopBody->getTerminator(), 0, this, false, false, true);
+//  SplitCriticalEdge(LoopBody->getTerminator(), 1, this, false, false, true);
+
   // Construct worklists
   SmallVector<SmallVectorImpl<Instruction*>*,4> worklists;
-  for(unsigned interval = 0; interval < NumberOfInterleavedItterations; interval++) {
+  for(unsigned interval = 0; interval < NumberOfInterleavedIterations; interval++) {
     // Construct worklist for each interval
     SmallVectorImpl<Instruction*> *worklist = new SmallVector<Instruction *, 8>();
 
@@ -1160,61 +1206,348 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     worklists.push_back(worklist);
   }
 
-#if 0
-  unsigned interval = 0;
-  for(auto worklist : worklists) {
-    DEBUG(dbgs() << "Operations to schedule for interval " << interval << "\n");
-    for(auto op : *worklist) {
-      DEBUG(op->dump());
-    }
-    interval++;
-  }
-#endif
+  /*
+   * Construct the prologue
+   */
+  // Instruction translation maps
+  SmallVector<DenseMap<Value *, Value *>*, 4> TranslationMaps;
 
-  DEBUG(dbgs() << "LP: Prologue\n");
-  for(unsigned interval = 0; interval < NumberOfInterleavedItterations-1; interval++) {
-    DEBUG(dbgs() << " Operations to schedule for stage " << interval << "\n");
-    for(unsigned block = interval+1; block;) {
+  unsigned stage = 0;
+  for(; stage < NumberOfInterleavedIterations-1; stage++) {
+    // Create new translation map
+    DenseMap<Value *, Value *> *TranslationMap = new DenseMap<Value *, Value *>();
+
+    // Store translation map
+    TranslationMaps.push_back(TranslationMap);
+
+    // Insert operations
+    for(unsigned block = stage+1; block;) {
       for(auto op : *worklists[--block]) {
-        DEBUG(op->dump());
+        switch(op->getOpcode()) {
+        case Instruction::Br:
+          // No control-flow is needed during prologue
+          break;
+        case Instruction::PHI: {
+          // Translate phi nodes either into the original inputs or into
+          // results from the previous stage
+          PHINode *Phi = dyn_cast<PHINode>(op);
+          if(stage == 0) {
+            // First iteration, values come from outside the loop
+            (*TranslationMap)[Phi] =
+                  Phi->getIncomingValueForBlock(OldPreheaderBlock);
+          } else {
+            // Value is served over back-edge of original loop
+            Value *V = Phi->getIncomingValueForBlock(LoopBody);
+
+            // Find definition in previous stage and insert
+            (*TranslationMap)[Phi] = (*TranslationMaps[stage-1])[V];
+          }
+          break; }
+        default: {
+          // Construct instruction from original loop body and register it in
+          // current stage.
+          Instruction *Inst = dyn_cast<Instruction>(op);
+          // Clone instruction
+          Instruction *NewNode = Inst->clone();
+          if(Inst->hasName())
+            NewNode->setName(Inst->getName() + ".lp" + Twine(stage));
+
+          // Rewrite operands with previously cloned versions
+          for(unsigned OpIdx = 0; OpIdx < NewNode->getNumOperands(); OpIdx++) {
+            Instruction *Op = dyn_cast<Instruction>(NewNode->getOperand(OpIdx));
+
+            if(Op && Op->getParent() == LoopBody) {
+              // Replace operand with cloned version
+              // Find stage distance between Operand and NewNode
+              unsigned distance = (ScheduledNodes[Inst]/II - ScheduledNodes[Op]/II);
+
+              // Get replacement operand
+              Value *NewOp = (*TranslationMaps[stage-distance])[Op];
+              assert(NewOp && "Undefined node encountered during rewriting");
+
+              // Replace operand
+              NewNode->setOperand(OpIdx, NewOp);
+            }
+          }
+
+          // Add new node to CurrentStage
+          NewNode->insertBefore(Prologue->getTerminator());
+
+          // Try to constant fold new operation
+          if(Constant *C = ConstantFoldInstruction(NewNode, DL, TLI)) {
+            // Add the constant value to the list when successful
+            (*TranslationMap)[op] = C;
+
+            // Discard the newly inserted operation
+            NewNode->eraseFromParent();
+          } else {
+            // Add new node to translation map and keep it in the current stage
+            (*TranslationMap)[op] = NewNode;
+          }
+          break; }
+        }
       }
     }
   }
 
-  DEBUG(dbgs() << "LP: Kernel\n");
-  for(unsigned block = NumberOfInterleavedItterations; block;) {
-    for(auto op : *worklists[--block]) {
-      DEBUG(op->dump());
+  DEBUG(Prologue->dump());
+
+  /*
+   * Construct the kernel
+   */
+  // Create new translation map
+  DenseMap<Value *, Value *> *TranslationMap = new DenseMap<Value *, Value *>();
+  DenseMap<PHINode *, Value *> PhiNodeMap;
+  // Store translation map
+  TranslationMaps.push_back(TranslationMap);
+
+  // Insert operations
+  for(unsigned block = NumberOfInterleavedIterations; block;) {
+    for(auto I : *worklists[--block]) {
+      switch(I->getOpcode()) {
+        case Instruction::Br:
+          // The loop branch instruction is inserted after constructing the kernel
+          break;
+        case Instruction::PHI: {
+          // Translate phi nodes into results from the previous stage
+          PHINode *Phi = dyn_cast<PHINode>(I);
+          // Value is served over back-edge of original loop
+          Value *V = Phi->getIncomingValueForBlock(LoopBody);
+
+          // Find definition in previous stage and create Phi node
+          PHINode *NewPhi = PHINode::Create(V->getType(), 2, "", PipelinedBody->getFirstNonPHI());
+          if(V->hasName()) NewPhi->setName(V->getName()+".lp.kernel.phi");
+
+          // Add edge from prologue
+          NewPhi->addIncoming((*TranslationMaps[stage-1])[V],Prologue);
+          PhiNodeMap[NewPhi] = V;
+
+          // Add the newly created Phi node to the translation map
+          (*TranslationMap)[Phi] = NewPhi;
+          break; }
+        default: {
+          // Construct instruction from original loop body and register it in
+          // current stage.
+          Instruction *Inst = dyn_cast<Instruction>(I);
+          // Clone instruction
+          Instruction *NewNode = Inst->clone();
+          if(Inst->hasName())
+            NewNode->setName(Inst->getName() + ".lp.kernel");
+
+          // Rewrite operands with previously cloned versions
+          for(unsigned OpIdx = 0; OpIdx < Inst->getNumOperands(); OpIdx++) {
+            Instruction *Op = dyn_cast<Instruction>(Inst->getOperand(OpIdx));
+
+            if(Op && Op->getParent() == LoopBody) {
+              // Replace operand with cloned version
+              // Find stage distance between Operand and NewNode
+              unsigned distance = (ScheduledNodes[Inst]/II - ScheduledNodes[Op]/II);
+
+              // Get replacement operand
+              Value *NewOp;
+              if(distance) {
+                // TODO check for values crossing multiple stage boundaries
+                // FIXME this has problems with several of the test loops
+                //
+                // These need extra phi nodes in the kernel construction which
+                // are currently not generated
+#if 1
+                DEBUG(dbgs() << "\n"; Op->dump(); Inst->dump());
+#endif
+//                assert(distance == 1 && "LP: FATAL unsupported dependency length");
+
+                // Construct new phi node and copy the value name from the parent
+                PHINode *NewPhi = PHINode::Create(
+                    Op->getType(), 2, "", PipelinedBody->getFirstNonPHI());
+
+                if(Op->hasName()) NewPhi->setName(Op->getName()+".lp.kernel.phi");
+
+                // Add edge from prologue
+                Value *OldV = (*TranslationMaps[stage-1])[Op];
+                assert(OldV != nullptr);
+                OldV->dump();
+                NewPhi->addIncoming(OldV,Prologue);
+                PhiNodeMap[NewPhi] = Op;
+
+                NewOp = NewPhi;
+              } else {
+                NewOp = (*TranslationMap)[Op];
+              }
+              assert(NewOp && "Undefined node encountered during rewriting");
+
+              // Replace operand
+              NewNode->setOperand(OpIdx, NewOp);
+            }
+          }
+
+          // Add new node to CurrentStage
+          NewNode->insertBefore(PipelinedBody->getTerminator());
+
+          // Try to constant fold new operation
+          if(Constant *C = ConstantFoldInstruction(NewNode, DL, TLI)) {
+            // Add the constant value to the list when successful
+            (*TranslationMap)[I] = C;
+
+            // Discard the newly inserted operation
+            NewNode->eraseFromParent();
+          } else {
+            // Add new node to translation map and keep it in the current stage
+            (*TranslationMap)[I] = NewNode;
+          }
+          break; }
+      }
     }
   }
 
-  DEBUG(dbgs() << "LP: Epilogue\n");
-  for(unsigned interval = 1; interval < NumberOfInterleavedItterations ; interval++) {
-    DEBUG(dbgs() << " Operations to schedule for stage " << (interval-1) << "\n");
-    for(unsigned block = interval; block < NumberOfInterleavedItterations; block++) {
+  // Add kernel back-edges to newly create Phi nodes
+  for(auto PNMapping : PhiNodeMap) {
+    PHINode *PN = PNMapping.first;
+    Value *V = (*TranslationMap)[PNMapping.second];
+    assert(V && "Foo!");
+    PN->addIncoming(V, PipelinedBody);
+  }
+
+  // Insert new loop condition
+  BranchInst *Term = cast<BranchInst>(LoopBody->getTerminator());
+  BranchInst *OldTerm = cast<BranchInst>(PipelinedBody->getTerminator());
+  Value *Cond = (*TranslationMap)[Term->getCondition()];
+
+  // Make sure that the true and false destinations match the original loop
+  if(Term->getSuccessor(0) == LoopBody) {
+    BranchInst::Create(PipelinedBody, Epilogue, Cond, PipelinedBody);
+  } else {
+    BranchInst::Create(Epilogue, PipelinedBody, Cond, PipelinedBody);
+  }
+  OldTerm->eraseFromParent();
+
+  /*
+   * Construct the epilogue
+   */
+  for(stage++; stage < 2 * NumberOfInterleavedIterations - 1; stage++) {
+    // Create new translation map
+    DenseMap<Value *, Value *> *TranslationMap = new DenseMap<Value *, Value *>();
+
+    // Store translation map
+    TranslationMaps.push_back(TranslationMap);
+
+    // Insert operations
+    for(unsigned block = stage - NumberOfInterleavedIterations + 1;
+                 block < NumberOfInterleavedIterations;
+                 block++) {
       for(auto op : *worklists[block]) {
-        DEBUG(op->dump());
+        switch(op->getOpcode()) {
+        case Instruction::Br:
+          // No control-flow is needed during the epilogue
+          break;
+        case Instruction::PHI: {
+          // Translate phi nodes either into the original inputs or into
+          // results from the previous stage
+          PHINode *Phi = dyn_cast<PHINode>(op);
+
+          // Value is served over back-edge of original loop
+          Value *V = Phi->getIncomingValueForBlock(LoopBody);
+
+          // Find definition in previous stage and insert
+          (*TranslationMap)[Phi] = (*TranslationMaps[stage-1])[V];
+          break; }
+        default: {
+          // Construct instruction from original loop body and register it in
+          // current stage.
+          Instruction *Inst = dyn_cast<Instruction>(op);
+          // Clone instruction
+          Instruction *NewNode = Inst->clone();
+          if(Inst->hasName())
+            NewNode->setName(Inst->getName() + ".lp" + Twine(stage));
+
+          // Rewrite operands with previously cloned versions
+          for(unsigned OpIdx = 0; OpIdx < NewNode->getNumOperands(); OpIdx++) {
+            Instruction *Op = dyn_cast<Instruction>(NewNode->getOperand(OpIdx));
+
+            if(Op && Op->getParent() == LoopBody) {
+              // Replace operand with cloned version
+              // Find stage distance between Operand and NewNode
+              unsigned distance = (ScheduledNodes[Inst]/II - ScheduledNodes[Op]/II);
+
+              // Get replacement operand
+              Value *NewOp = (*TranslationMaps[stage-distance])[Op];
+              assert(NewOp && "Undefined node encountered during rewriting");
+
+              // Replace operand
+              NewNode->setOperand(OpIdx, NewOp);
+            }
+          }
+
+          // Add new node to CurrentStage
+          NewNode->insertBefore(Epilogue->getTerminator());
+
+          // Try to constant fold new operation
+          if(Constant *C = ConstantFoldInstruction(NewNode, DL, TLI)) {
+            // Add the constant value to the list when successful
+            (*TranslationMap)[op] = C;
+
+            // Discard the newly inserted operation
+            NewNode->eraseFromParent();
+          } else {
+            // Add new node to translation map and keep it in the current stage
+            (*TranslationMap)[op] = NewNode;
+          }
+          break; }
+        }
       }
     }
   }
 
+  /*
+   * Successfully constructed pipelined loop contents.
+   *
+   * Now create the latch block that guards the pipelined version of the loop.
+   */
+  // Get branch condition from prologue to construct selector block
+  BranchInst *LoopBr = cast<BranchInst>(LoopBody->getTerminator());
+  Instruction *PrologueBranchCond = dyn_cast<Instruction>(
+    (*TranslationMaps[NumberOfInterleavedIterations-2])[LoopBr->getCondition()]);
 
-  // Use split block to extend number of blocks in prologue/epilogue
+  assert(PrologueBranchCond && "Could not find branch condition for prologue");
 
-  // Construct prologue
-  // Find operations for first II cycles of schedule
-  // Fix connections for Phi nodes
-  // Insert operations into prologue
+  // TODO: check if we need to move multiple operations
+  // Move the branch condition with all of its dependencies into the selector
+  // block.
+  //
+  // Also remove the unused versions from the prologue and replce the
+  // occurences in the prologue with the operation inserted into the selector
+  // block.
+  PrologueBranchCond->removeFromParent();
+  PrologueBranchCond->insertBefore(OldPreheaderBlock->getTerminator());
 
-  // Clean-up worklists
+  // Replace branch in selector block with a conditional branch
+  TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
+  if(LoopBr->getSuccessor(0) == LoopBody) {
+    BranchInst::Create(Prologue, LoopBody, PrologueBranchCond, OldBranch);
+  } else {
+    BranchInst::Create(LoopBody, Prologue, PrologueBranchCond, OldBranch);
+  }
+  OldBranch->eraseFromParent();
+
+  /*
+   * Clean-up allocated structures and generated code
+   */
   for(auto worklist : worklists) {
     delete worklist;
   }
+  for(auto translationmap : TranslationMaps) {
+    delete translationmap;
+  }
 
-  // Invalidate old loop in SCEV cache
+  // Invalidate old loop in SCEV cache so that its itteration count can be
+  // reconsidered
   SE->forgetLoop(L);
 
-  // Cleanup: DCE, CSE, ...
+  // Fixme: Cleanup
+  //
+  // Constant propagation within blocks has been done but may result in an
+  // always true or false for the latch condition.  Recognizing this allows for
+  // elimination of either the original or pipelined loop and provides further
+  // simplification of the generated code.
 
   // Done
   LoopsPipelined++;
@@ -1268,4 +1601,3 @@ void LoopPipeline::scheduleALAP(BasicBlock *B, unsigned LastOperationStart, Part
     schedule[II] = DepsALAP;
   }
 }
-
