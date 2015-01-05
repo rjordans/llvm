@@ -35,6 +35,7 @@
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
@@ -82,6 +83,7 @@ namespace {
 
     bool runOnFunction(Function &F) override {
       DA = &getAnalysis<DependenceAnalysis>();
+      DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
       LI = &getAnalysis<LoopInfo>();
       SE = &getAnalysis<ScalarEvolution>();
       TTI = &getAnalysis<TargetTransformInfo>();
@@ -112,6 +114,7 @@ namespace {
 
     void getAnalysisUsage(AnalysisUsage &AU) const override {
       AU.addRequired<DependenceAnalysis>();
+      AU.addRequired<DominatorTreeWrapperPass>();
       AU.addRequired<LoopInfo>();
       AU.addRequired<ScalarEvolution>();
       AU.addRequired<TargetTransformInfo>();
@@ -121,6 +124,7 @@ namespace {
   private:
     const DataLayout *DL;
     DependenceAnalysis *DA;
+    DominatorTree *DT;
     LoopInfo *LI;
     ScalarEvolution *SE;
     TargetTransformInfo *TTI;
@@ -192,6 +196,7 @@ char LoopPipeline::ID = 0;
 INITIALIZE_PASS_BEGIN(LoopPipeline, "loop-pipeline",
                 "Software pipeline inner-loops", false, false)
 INITIALIZE_PASS_DEPENDENCY(DependenceAnalysis)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfo)
@@ -1290,7 +1295,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     }
   }
 
+#if 1
   DEBUG(Prologue->dump());
+#endif
 
   /*
    * Construct the kernel
@@ -1420,6 +1427,10 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   }
   OldTerm->eraseFromParent();
 
+#if 1
+  DEBUG(PipelinedBody->dump());
+#endif
+
   /*
    * Construct the epilogue
    */
@@ -1497,6 +1508,10 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     }
   }
 
+#if 1
+  DEBUG(Epilogue->dump());
+#endif
+
   /*
    * Successfully constructed pipelined loop contents.
    *
@@ -1509,15 +1524,41 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
   assert(PrologueBranchCond && "Could not find branch condition for prologue");
 
-  // TODO: check if we need to move multiple operations
   // Move the branch condition with all of its dependencies into the selector
   // block.
   //
   // Also remove the unused versions from the prologue and replce the
   // occurences in the prologue with the operation inserted into the selector
   // block.
-  PrologueBranchCond->removeFromParent();
-  PrologueBranchCond->insertBefore(OldPreheaderBlock->getTerminator());
+  //
+  // FIXME: This currently does not check if the branch condition computation
+  // contains operations which may trap.  For example, loops which have
+  // multiple iterations in the prologue and for which an operation in the
+  // second iteration causes a trap if executed while there is only sufficient
+  // data for a single operation.
+  SmallVector<Instruction *, 4> MoveList;
+  for(auto I = Prologue->begin(), E = Prologue->end(); I != E; I++) {
+    Instruction *Inst = dyn_cast<Instruction>(I);
+
+    // Only consider instructions?
+    if(!Inst) continue;
+
+    // There will be no nodes that dominate PrologueBranchCond after it
+    if(Inst == PrologueBranchCond) break;
+
+    // Add node to the move list if it dominates the branch condition
+    if(DT->dominates(I, PrologueBranchCond)) {
+      MoveList.push_back(I);
+    }
+  }
+  // Don't forget to move the branch condition itself
+  MoveList.push_back(PrologueBranchCond);
+
+  // Do the move!
+  for(auto I : MoveList) {
+    I->removeFromParent();
+    I->insertBefore(OldPreheaderBlock->getTerminator());
+  }
 
   // Replace branch in selector block with a conditional branch
   TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
