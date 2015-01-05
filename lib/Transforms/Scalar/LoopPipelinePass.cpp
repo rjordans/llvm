@@ -35,7 +35,6 @@
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/DataLayout.h"
-#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Pass.h"
@@ -83,7 +82,6 @@ namespace {
 
     bool runOnFunction(Function &F) override {
       DA = &getAnalysis<DependenceAnalysis>();
-      DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
       LI = &getAnalysis<LoopInfo>();
       SE = &getAnalysis<ScalarEvolution>();
       TTI = &getAnalysis<TargetTransformInfo>();
@@ -114,7 +112,6 @@ namespace {
 
     void getAnalysisUsage(AnalysisUsage &AU) const override {
       AU.addRequired<DependenceAnalysis>();
-      AU.addRequired<DominatorTreeWrapperPass>();
       AU.addRequired<LoopInfo>();
       AU.addRequired<ScalarEvolution>();
       AU.addRequired<TargetTransformInfo>();
@@ -124,7 +121,6 @@ namespace {
   private:
     const DataLayout *DL;
     DependenceAnalysis *DA;
-    DominatorTree *DT;
     LoopInfo *LI;
     ScalarEvolution *SE;
     TargetTransformInfo *TTI;
@@ -196,7 +192,6 @@ char LoopPipeline::ID = 0;
 INITIALIZE_PASS_BEGIN(LoopPipeline, "loop-pipeline",
                 "Software pipeline inner-loops", false, false)
 INITIALIZE_PASS_DEPENDENCY(DependenceAnalysis)
-INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfo)
@@ -1536,23 +1531,40 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   // multiple iterations in the prologue and for which an operation in the
   // second iteration causes a trap if executed while there is only sufficient
   // data for a single operation.
-  SmallVector<Instruction *, 4> MoveList;
-  for(auto I = Prologue->begin(), E = Prologue->end(); I != E; I++) {
-    Instruction *Inst = dyn_cast<Instruction>(I);
+  SmallVector<Instruction *,4> MoveList;
+  std::set<Instruction *> MoveSet;
+  std::set<Instruction *> WorkSet;
+  WorkSet.insert(PrologueBranchCond);
 
-    // Only consider instructions?
-    if(!Inst) continue;
+  while(!WorkSet.empty()) {
+    // Get first element from WorkSet
+    Instruction *Inst = *WorkSet.begin();
+    WorkSet.erase(WorkSet.begin());
 
-    // There will be no nodes that dominate PrologueBranchCond after it
-    if(Inst == PrologueBranchCond) break;
+    DEBUG(dbgs() << "LP: Considering to move"; Inst->dump());
 
-    // Add node to the move list if it dominates the branch condition
-    if(DT->dominates(I, PrologueBranchCond)) {
-      MoveList.push_back(I);
+    // Add to MoveSet for our administration
+    MoveSet.insert(Inst);
+
+    // Add the operation for moving
+    MoveList.push_back(Inst);
+
+    // Consider the operands of the added operation for addition
+    for(auto &op : Inst->operands()) {
+      Instruction *I = dyn_cast<Instruction>(op);
+
+      // Only add instructions that are within the current block and have not
+      // been considered yet
+      if(I && I->getParent() == Prologue
+           && MoveSet.find(I) == MoveSet.end()) {
+        DEBUG(dbgs() << "LP: Adding "; I->dump());
+        WorkSet.insert(I);
+      }
     }
   }
-  // Don't forget to move the branch condition itself
-  MoveList.push_back(PrologueBranchCond);
+
+  // Reverse the move list to get the right insertion order
+  std::reverse(MoveList.begin(), MoveList.end());
 
   // Do the move!
   for(auto I : MoveList) {
