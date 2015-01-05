@@ -294,7 +294,7 @@ bool LoopPipeline::canPipelineLoop(Loop *L, CodeMetrics &CM) {
   // - ...
 
   // Check loop for anti-dependencies through store-load combinations
-  // TODO: add a dependency breaking pass
+  // TODO: Consider adding a dependency breaking pass
 
   // Build lists of read and write operations for memory dependence checking
   SmallVector<Instruction*, 2> Writes;
@@ -1194,7 +1194,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   }
   Lp->addBasicBlockToLoop(PipelinedBody, LI->getBase());
 
-  // TODO split critical edges from OldPreheaderBlock when finished
+  // TODO: Split critical edges from OldPreheaderBlock when finished
 //  SplitCriticalEdge(LoopBody->getTerminator(), 0, this, false, false, true);
 //  SplitCriticalEdge(LoopBody->getTerminator(), 1, this, false, false, true);
 
@@ -1353,8 +1353,8 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
               // Get replacement operand
               Value *NewOp;
               if(distance) {
-                // TODO check for values crossing multiple stage boundaries
-                // FIXME this has problems with several of the test loops
+                // TODO: Check for values crossing multiple stage boundaries
+                // FIXME: This has problems with several of the test loops
                 //
                 // These need extra phi nodes in the kernel construction which
                 // are currently not generated
@@ -1561,6 +1561,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   }
 
   // Replace branch in selector block with a conditional branch
+  //
+  // FIXME: Detect when the branch condition reduces to a constant and discard
+  // unreachable loops accordingly.
   TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
   if(LoopBr->getSuccessor(0) == LoopBody) {
     BranchInst::Create(Prologue, LoopBody, PrologueBranchCond, OldBranch);
