@@ -1222,15 +1222,15 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
     // Insert operations
     for(unsigned block = stage+1; block;) {
-      for(auto op : *worklists[--block]) {
-        switch(op->getOpcode()) {
+      for(auto I : *worklists[--block]) {
+        switch(I->getOpcode()) {
         case Instruction::Br:
           // No control-flow is needed during prologue
           break;
         case Instruction::PHI: {
           // Translate phi nodes either into the original inputs or into
           // results from the previous stage
-          PHINode *Phi = dyn_cast<PHINode>(op);
+          PHINode *Phi = dyn_cast<PHINode>(I);
           if(stage == 0) {
             // First iteration, values come from outside the loop
             (*TranslationMap)[Phi] =
@@ -1239,14 +1239,24 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
             // Value is served over back-edge of original loop
             Value *V = Phi->getIncomingValueForBlock(LoopBody);
 
+            // Try to find the incoming value in the previous stages
+            Value *OldV = (*TranslationMaps[stage-1])[V];
+
+            // If OldV is a nullptr we didn't schedule the operation for the
+            // prologue yet.  In this case, fall back to the other input value
+            // for the original phi operation.
+            if(OldV == nullptr) {
+              OldV = Phi->getIncomingValueForBlock(OldPreheaderBlock);
+            }
+
             // Find definition in previous stage and insert
-            (*TranslationMap)[Phi] = (*TranslationMaps[stage-1])[V];
+            (*TranslationMap)[Phi] = OldV;
           }
           break; }
         default: {
           // Construct instruction from original loop body and register it in
           // current stage.
-          Instruction *Inst = dyn_cast<Instruction>(op);
+          Instruction *Inst = dyn_cast<Instruction>(I);
           // Clone instruction
           Instruction *NewNode = Inst->clone();
           if(Inst->hasName())
@@ -1276,13 +1286,15 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           // Try to constant fold new operation
           if(Constant *C = ConstantFoldInstruction(NewNode, DL, TLI)) {
             // Add the constant value to the list when successful
-            (*TranslationMap)[op] = C;
+            (*TranslationMap)[I] = C;
+
+            DEBUG(dbgs() << "LP: Constant folding"; I->dump(); dbgs() << "  to"; C->dump());
 
             // Discard the newly inserted operation
             NewNode->eraseFromParent();
           } else {
             // Add new node to translation map and keep it in the current stage
-            (*TranslationMap)[op] = NewNode;
+            (*TranslationMap)[I] = NewNode;
           }
           break; }
         }
@@ -1304,8 +1316,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   TranslationMaps.push_back(TranslationMap);
 
   // Insert operations
-  for(unsigned block = NumberOfInterleavedIterations; block;) {
+  for(unsigned block = NumberOfInterleavedIterations; block; ) {
     for(auto I : *worklists[--block]) {
+      DEBUG(I->dump());
       switch(I->getOpcode()) {
         case Instruction::Br:
           // The loop branch instruction is inserted after constructing the kernel
@@ -1313,6 +1326,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         case Instruction::PHI: {
           // Translate phi nodes into results from the previous stage
           PHINode *Phi = dyn_cast<PHINode>(I);
+
           // Value is served over back-edge of original loop
           Value *V = Phi->getIncomingValueForBlock(LoopBody);
 
@@ -1320,8 +1334,18 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           PHINode *NewPhi = PHINode::Create(V->getType(), 2, "", PipelinedBody->getFirstNonPHI());
           if(V->hasName()) NewPhi->setName(V->getName()+".lp.kernel.phi");
 
+          // Try to find the incoming value in the previous stages
+          Value *OldV = (*TranslationMaps[stage-1])[V];
+
+          // If OldV is a nullptr we didn't schedule the operation for the
+          // kernel yet.  In this case, fall back to the other input value for
+          // the original phi operation.
+          if(OldV == nullptr) {
+            OldV = Phi->getIncomingValueForBlock(OldPreheaderBlock);
+          }
+
           // Add edge from prologue
-          NewPhi->addIncoming((*TranslationMaps[stage-1])[V],Prologue);
+          NewPhi->addIncoming(OldV, Prologue);
           PhiNodeMap[NewPhi] = V;
 
           // Add the newly created Phi node to the translation map
@@ -1354,7 +1378,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
                 // These need extra phi nodes in the kernel construction which
                 // are currently not generated
 #if 1
-                DEBUG(dbgs() << "\n"; Op->dump(); Inst->dump());
+                DEBUG(dbgs() << "\n  Edge from:"; Op->dump(); dbgs() << "  To:"; Inst->dump());
 #endif
 //                assert(distance == 1 && "LP: FATAL unsupported dependency length");
 
@@ -1366,8 +1390,10 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
                 // Add edge from prologue
                 Value *OldV = (*TranslationMaps[stage-1])[Op];
-                assert(OldV != nullptr);
-                OldV->dump();
+                assert(OldV);
+#if 1
+                DEBUG(dbgs() << "  Becomes from:"; OldV->dump());
+#endif
                 NewPhi->addIncoming(OldV,Prologue);
                 PhiNodeMap[NewPhi] = Op;
 
@@ -1389,6 +1415,8 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           if(Constant *C = ConstantFoldInstruction(NewNode, DL, TLI)) {
             // Add the constant value to the list when successful
             (*TranslationMap)[I] = C;
+
+            DEBUG(dbgs() << "LP: Constant folding"; I->dump(); dbgs() << "  to"; C->dump());
 
             // Discard the newly inserted operation
             NewNode->eraseFromParent();
@@ -1440,15 +1468,15 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     for(unsigned block = stage - NumberOfInterleavedIterations + 1;
                  block < NumberOfInterleavedIterations;
                  block++) {
-      for(auto op : *worklists[block]) {
-        switch(op->getOpcode()) {
+      for(auto I : *worklists[block]) {
+        switch(I->getOpcode()) {
         case Instruction::Br:
           // No control-flow is needed during the epilogue
           break;
         case Instruction::PHI: {
           // Translate phi nodes either into the original inputs or into
           // results from the previous stage
-          PHINode *Phi = dyn_cast<PHINode>(op);
+          PHINode *Phi = dyn_cast<PHINode>(I);
 
           // Value is served over back-edge of original loop
           Value *V = Phi->getIncomingValueForBlock(LoopBody);
@@ -1459,7 +1487,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         default: {
           // Construct instruction from original loop body and register it in
           // current stage.
-          Instruction *Inst = dyn_cast<Instruction>(op);
+          Instruction *Inst = dyn_cast<Instruction>(I);
           // Clone instruction
           Instruction *NewNode = Inst->clone();
           if(Inst->hasName())
@@ -1489,13 +1517,15 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           // Try to constant fold new operation
           if(Constant *C = ConstantFoldInstruction(NewNode, DL, TLI)) {
             // Add the constant value to the list when successful
-            (*TranslationMap)[op] = C;
+            (*TranslationMap)[I] = C;
+
+            DEBUG(dbgs() << "LP: Constant folding"; I->dump(); dbgs() << "  to"; C->dump());
 
             // Discard the newly inserted operation
             NewNode->eraseFromParent();
           } else {
             // Add new node to translation map and keep it in the current stage
-            (*TranslationMap)[op] = NewNode;
+            (*TranslationMap)[I] = NewNode;
           }
           break; }
         }
