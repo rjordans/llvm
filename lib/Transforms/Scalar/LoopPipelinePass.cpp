@@ -585,6 +585,13 @@ static unsigned getInstructionCost(const Instruction *I, const TargetTransformIn
       return TTI->getIntrinsicInstrCost(II->getIntrinsicID(), II->getType(),
                                         Tys);
     }
+
+    if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+      ImmutableCallSite CS(cast<Instruction>(I));
+      if (const Function *F = CS.getCalledFunction()) {
+        return TTI->getCallCost(F);
+      }
+    }
     return -1;
   default:
     // We don't have any information on this instruction.
@@ -1189,7 +1196,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   }
   Lp->addBasicBlockToLoop(PipelinedBody, LI->getBase());
 
-  // TODO: Split critical edges from OldPreheaderBlock when finished
+  // TODO: Split critical edges from OldPreheaderBlock when finished?
 //  SplitCriticalEdge(LoopBody->getTerminator(), 0, this, false, false, true);
 //  SplitCriticalEdge(LoopBody->getTerminator(), 1, this, false, false, true);
 
@@ -1433,7 +1440,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   for(auto PNMapping : PhiNodeMap) {
     PHINode *PN = PNMapping.first;
     Value *V = (*TranslationMap)[PNMapping.second];
-    assert(V && "Foo!");
     PN->addIncoming(V, PipelinedBody);
   }
 
