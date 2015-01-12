@@ -1546,79 +1546,134 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   /*
    * Successfully constructed pipelined loop contents.
    *
-   * Now create the latch block that guards the pipelined version of the loop.
+   * Now connect the live-out variables of both loop versions using phi nodes
+   * in the merge block and create the latch block that guards the pipelined
+   * version of the loop.
    */
   // Get branch condition from prologue to construct selector block
   BranchInst *LoopBr = cast<BranchInst>(LoopBody->getTerminator());
-  Instruction *PrologueBranchCond = dyn_cast<Instruction>(
-    (*TranslationMaps[NumberOfInterleavedIterations-2])[LoopBr->getCondition()]);
 
-  assert(PrologueBranchCond && "Could not find branch condition for prologue");
+  // There are N-1 blocks in the prologue and we start counting from 0 so use
+  // -2 as index to reach the branch condition for the last iteration within
+  // the prologue
+  Value *PrologueBranchValue =
+    (*TranslationMaps[NumberOfInterleavedIterations-2])[LoopBr->getCondition()];
 
-  // Move the branch condition with all of its dependencies into the selector
-  // block.
-  //
-  // Also remove the unused versions from the prologue and replce the
-  // occurences in the prologue with the operation inserted into the selector
-  // block.
-  //
-  // FIXME: This currently does not check if the branch condition computation
-  // contains operations which may trap.  For example, loops which have
-  // multiple iterations in the prologue and for which an operation in the
-  // second iteration causes a trap if executed while there is only sufficient
-  // data for a single operation.
-  SmallVector<Instruction *,4> MoveList;
-  std::set<Instruction *> MoveSet;
-  std::set<Instruction *> WorkSet;
-  WorkSet.insert(PrologueBranchCond);
+  // Check if the branch condition actually is an Instruction or if it's a Constant
+  if(Instruction *PrologueBranchCond = dyn_cast<Instruction>(PrologueBranchValue)) {
+    assert(PrologueBranchCond && "Could not find branch condition for prologue");
 
-  while(!WorkSet.empty()) {
-    // Get first element from WorkSet
-    Instruction *Inst = *WorkSet.begin();
-    WorkSet.erase(WorkSet.begin());
+    // Move the branch condition with all of its dependencies into the selector
+    // block.
+    //
+    // Also remove the unused versions from the prologue and replce the
+    // occurences in the prologue with the operation inserted into the selector
+    // block.
+    //
+    // FIXME: This currently does not check if the branch condition computation
+    // contains operations which may trap.  For example, loops which have
+    // multiple iterations in the prologue and for which an operation in the
+    // second iteration causes a trap if executed while there is only sufficient
+    // data for a single operation.
+    SmallVector<Instruction *,4> MoveList;
+    std::set<Instruction *> MoveSet;
+    std::set<Instruction *> WorkSet;
+    WorkSet.insert(PrologueBranchCond);
 
-    DEBUG(dbgs() << "LP: Considering to move"; Inst->dump());
+    while(!WorkSet.empty()) {
+      // Get first element from WorkSet
+      Instruction *Inst = *WorkSet.begin();
+      WorkSet.erase(WorkSet.begin());
 
-    // Add to MoveSet for our administration
-    MoveSet.insert(Inst);
+      DEBUG(dbgs() << "LP: Considering to move"; Inst->dump());
 
-    // Add the operation for moving
-    MoveList.push_back(Inst);
+      // Add to MoveSet for our administration
+      MoveSet.insert(Inst);
 
-    // Consider the operands of the added operation for addition
-    for(auto &op : Inst->operands()) {
-      Instruction *I = dyn_cast<Instruction>(op);
+      // Add the operation for moving
+      MoveList.push_back(Inst);
 
-      // Only add instructions that are within the current block and have not
-      // been considered yet
-      if(I && I->getParent() == Prologue
-           && MoveSet.find(I) == MoveSet.end()) {
-        DEBUG(dbgs() << "LP: Adding "; I->dump());
-        WorkSet.insert(I);
+      // Consider the operands of the added operation for addition
+      for(auto &op : Inst->operands()) {
+        Instruction *I = dyn_cast<Instruction>(op);
+
+        // Only add instructions that are within the current block and have not
+        // been considered yet
+        if(I && I->getParent() == Prologue
+             && MoveSet.find(I) == MoveSet.end()) {
+          DEBUG(dbgs() << "LP: Adding "; I->dump());
+          WorkSet.insert(I);
+        }
       }
     }
-  }
 
-  // Reverse the move list to get the right insertion order
-  std::reverse(MoveList.begin(), MoveList.end());
+    // Reverse the move list to get the right insertion order
+    std::reverse(MoveList.begin(), MoveList.end());
 
-  // Do the move!
-  for(auto I : MoveList) {
-    I->removeFromParent();
-    I->insertBefore(OldPreheaderBlock->getTerminator());
-  }
+    // Do the move!
+    for(auto I : MoveList) {
+      I->removeFromParent();
+      I->insertBefore(OldPreheaderBlock->getTerminator());
+    }
 
-  // Replace branch in selector block with a conditional branch
-  //
-  // FIXME: Detect when the branch condition reduces to a constant and discard
-  // unreachable loops accordingly.
-  TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
-  if(LoopBr->getSuccessor(0) == LoopBody) {
-    BranchInst::Create(Prologue, LoopBody, PrologueBranchCond, OldBranch);
+    // Replace branch in selector block with a conditional branch
+    TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
+    if(LoopBr->getSuccessor(0) == LoopBody) {
+      BranchInst::Create(Prologue, LoopBody, PrologueBranchCond, OldBranch);
+    } else {
+      BranchInst::Create(LoopBody, Prologue, PrologueBranchCond, OldBranch);
+    }
+    OldBranch->eraseFromParent();
+
   } else {
-    BranchInst::Create(LoopBody, Prologue, PrologueBranchCond, OldBranch);
+    // Got a constant? value as loop condition which means we can do some
+    // cleanup.  Either we never enter the kernel loop and can drop the loop
+    // from existence.  Or we never need the backup original loop and can
+    // remove that one
+    ConstantInt *BranchCondition = dyn_cast<ConstantInt>(PrologueBranchValue);
+
+    assert(BranchCondition
+           && "Expected a constant branch condition in the prologue");
+
+    DEBUG(dbgs() << "LP: Found constant loop entry condition ";
+      BranchCondition->dump());
+
+    // New loop gets executed when:
+    // - Either BranchCondition == true & LoopBr->getSuccessor(0) == LoopBody
+    // - Or BranchCondition == false & LoopBr->getSuccessor(1) == LoopBody
+    if(BranchCondition->equalsInt(0) ^ (LoopBr->getSuccessor(0) == LoopBody)) {
+      // TODO: Maybe we could figure this out earlier and save some trouble ;)
+      //
+      // The new loop won't get executed, just keep the old one and undo our
+      // changes
+      DEBUG(dbgs() << "LP: Discarding pipelined loop as unused\n");
+
+      // Cleanup, remove pipelined loop and all other stuff we inserted
+#if 0
+      Epilogue->eraseFromParent();
+      LI->removeBlock(PipelinedBody);
+      SE->forgetLoop(Lp);
+      PipelinedBody->eraseFromParent();
+      Prologue->eraseFromParent();
+#endif
+      // Keep old branch (do nothing)
+    } else {
+      // The old loop won't get executed, remove it
+      DEBUG(dbgs() << "LP: Discarding original loop as unused\n");
+
+      // De-register and remove old loop
+      LI->removeBlock(LoopBody);
+      LoopBody->eraseFromParent();
+
+      // Insert new branch
+      TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
+      BranchInst::Create(Prologue, OldBranch);
+      OldBranch->eraseFromParent();
+
+      // Merge prologue and preheader blocks
+      MergeBlockIntoPredecessor(Prologue);
+    }
   }
-  OldBranch->eraseFromParent();
 
   /*
    * Clean-up allocated structures and generated code
