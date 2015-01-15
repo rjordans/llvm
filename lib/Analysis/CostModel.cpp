@@ -21,6 +21,7 @@
 #include "llvm/Analysis/CostModelAnalysis.h"
 #include "llvm/Analysis/Passes.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/CallSite.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -484,6 +485,13 @@ unsigned CostModelAnalysis::getInstructionCost(const Instruction *I) const {
       return TTI->getIntrinsicInstrCost(II->getIntrinsicID(), II->getType(),
                                         Tys);
     }
+    if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+      ImmutableCallSite CS(cast<Instruction>(I));
+      if (const Function *F = CS.getCalledFunction()) {
+        return TTI->getCallCost(F);
+      }
+    }
+
     return -1;
   default:
     // We don't have any information on this instruction.
