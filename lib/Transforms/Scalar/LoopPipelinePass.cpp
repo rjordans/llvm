@@ -1550,6 +1550,44 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
    * in the merge block and create the latch block that guards the pipelined
    * version of the loop.
    */
+  // Connect live-out variables of both loop versions
+  //
+  // For each live out variable of the LoopBody, add a phi-node to the
+  // OldExitBlock and replace all uses of the original value within the old
+  // exit block with the new phi-node.
+  for(auto I = LoopBody->begin(), E = LoopBody->end(); I != E; I++) {
+    for(auto U : I->users()) {
+      Instruction *Dep = dyn_cast<Instruction>(U);
+      if(Dep && Dep->getParent() != LoopBody) {
+        assert(isa<PHINode>(Dep)
+           && "Non-phi dependency found, loop not in canonical form");
+
+        if(PHINode *OldPhi = dyn_cast<PHINode>(Dep)) {
+          // Check if there is an edge already
+          if(OldPhi->getBasicBlockIndex(Epilogue) != -1)
+            continue;
+
+          // Find definition of new incomming value
+          Value *NewValue = nullptr;
+          for(int i = 2*NumberOfInterleavedIterations - 2;
+                 !NewValue && i > 0; i--) {
+            NewValue = (*TranslationMaps[i])[I];
+            if(NewValue) {
+              DEBUG(
+                dbgs() << "LP: Found NewValue " << i;
+                NewValue->dump()
+              );
+            }
+          }
+
+          // Add incomming value
+          assert(NewValue && "New value lookup failed?!?");
+          OldPhi->addIncoming(NewValue, Epilogue);
+        }
+      }
+    }
+  }
+
   // Get branch condition from prologue to construct selector block
   BranchInst *LoopBr = cast<BranchInst>(LoopBody->getTerminator());
 
