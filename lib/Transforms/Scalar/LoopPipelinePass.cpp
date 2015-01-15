@@ -1593,9 +1593,27 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
   // There are N-1 blocks in the prologue and we start counting from 0 so use
   // -2 as index to reach the branch condition for the last iteration within
-  // the prologue
-  Value *PrologueBranchValue =
-    (*TranslationMaps[NumberOfInterleavedIterations-2])[LoopBr->getCondition()];
+  // the prologue and -3 to find the one-before-last branch condition in the
+  // prologue.
+  //
+  // The -3 version should tell us if we actually have sufficient data to
+  // finish the prologue so that's the one we'll use when there are more than
+  // 2 interleaved iterations.  Otherwise we always branch into the pipelined
+  // loop as it should behave exactly like the original and this allows to
+  // remove the original loop completely.
+  Value *PrologueBranchValue;
+  if(NumberOfInterleavedIterations == 2) {
+    Type *ConditionType = LoopBr->getCondition()->getType();
+
+    if(LoopBr->getSuccessor(0) == LoopBody) {
+      PrologueBranchValue = ConstantInt::getTrue(ConditionType);
+    } else {
+      PrologueBranchValue = ConstantInt::getFalse(ConditionType);
+    }
+  } else {
+    PrologueBranchValue =
+      (*TranslationMaps[NumberOfInterleavedIterations-3])[LoopBr->getCondition()];
+  }
 
   // Check if the branch condition actually is an Instruction or if it's a Constant
   if(Instruction *PrologueBranchCond = dyn_cast<Instruction>(PrologueBranchValue)) {
