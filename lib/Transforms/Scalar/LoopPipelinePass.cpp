@@ -29,6 +29,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/CostModelAnalysis.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -70,8 +71,6 @@ static void addInnerLoop(Loop &L, SmallVectorImpl<Loop *> &V) {
     addInnerLoop(*InnerL, V);
 }
 
-static unsigned getInstructionCost(const Instruction *I, const TargetTransformInfo *TTI);
-
 namespace {
   class LoopPipeline : public FunctionPass {
   public:
@@ -81,6 +80,7 @@ namespace {
     }
 
     bool runOnFunction(Function &F) override {
+      CMA = &getAnalysis<CostModelAnalysis>();
       DA = &getAnalysis<DependenceAnalysis>();
       LI = &getAnalysis<LoopInfo>();
       SE = &getAnalysis<ScalarEvolution>();
@@ -111,14 +111,20 @@ namespace {
     }
 
     void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<CostModelAnalysis>();
       AU.addRequired<DependenceAnalysis>();
       AU.addRequired<LoopInfo>();
       AU.addRequired<ScalarEvolution>();
       AU.addRequired<TargetTransformInfo>();
       AU.addRequired<TargetLibraryInfo>();
+
+      AU.addPreserved<CostModelAnalysis>();
+      AU.addPreserved<TargetLibraryInfo>();
+      AU.addPreserved<TargetTransformInfo>();
     }
 
   private:
+    const CostModelAnalysis *CMA;
     const DataLayout *DL;
     DependenceAnalysis *DA;
     LoopInfo *LI;
@@ -128,13 +134,13 @@ namespace {
 
     class InstructionTrace {
     public:
-      InstructionTrace() : weight(0) {}
-      InstructionTrace(const InstructionTrace &IT) : trace(IT.trace), weight(IT.weight) {}
+      InstructionTrace(const CostModelAnalysis *CMA) : CMA(CMA), weight(0) {}
+      InstructionTrace(const InstructionTrace &IT) : CMA(IT.CMA), trace(IT.trace), weight(IT.weight) {}
 
       // Add instruction to trace
       void add(Instruction *I, TargetTransformInfo *TTI) {
         trace.push_back(I);
-        weight += getInstructionCost(I, TTI);
+        weight += CMA->getInstructionCost(I);
       }
 
       // Access methods
@@ -161,6 +167,7 @@ namespace {
         return weight <= T.weight && this != &T;
       }
     private:
+      const CostModelAnalysis *CMA;
       SmallVector<Instruction *, 8> trace;
       unsigned weight;
     };
@@ -400,7 +407,7 @@ unsigned LoopPipeline::computeRecurrenceMII(Loop *L, CycleSet &cycles) {
     if( !Phi )
       continue;
 
-    InstructionTrace trace;
+    InstructionTrace trace(CMA);
     getPhiCycles(Phi, Phi, trace, cycles);
   }
 
@@ -452,152 +459,6 @@ unsigned LoopPipeline::computeResourceMII(CodeMetrics &CM) {
   return ResMII;
 }
 
-//***************************************************************************
-// Instruction cost model used during the different scheduling runs
-//***************************************************************************
-//
-// FIXME: Large amounts of code duplication from lib/Analysis/CostModel.cpp
-// A more generalized cost model could be very useful as loop vectorization
-// also seems to implement its own version.
-//
-// - Needs a lot of improvement to better reflect the operation latencies and
-//   possibly more hooks into TTI
-static TargetTransformInfo::OperandValueKind getOperandInfo(Value *V) {
-  TargetTransformInfo::OperandValueKind OpInfo =
-    TargetTransformInfo::OK_AnyValue;
-
-  // Check for a splat of a constant or for a non uniform vector of constants.
-  if (isa<ConstantVector>(V) || isa<ConstantDataVector>(V)) {
-    OpInfo = TargetTransformInfo::OK_NonUniformConstantValue;
-    if (cast<Constant>(V)->getSplatValue() != nullptr)
-      OpInfo = TargetTransformInfo::OK_UniformConstantValue;
-  }
-
-  return OpInfo;
-}
-
-static unsigned getInstructionCost(const Instruction *I, const TargetTransformInfo *TTI) {
-
-  switch (I->getOpcode()) {
-  case Instruction::GetElementPtr:{
-    Type *ValTy = I->getOperand(0)->getType()->getPointerElementType();
-    return TTI->getAddressComputationCost(ValTy);
-  }
-
-  case Instruction::Ret:
-  case Instruction::PHI:
-  case Instruction::Br: {
-    return TTI->getCFInstrCost(I->getOpcode());
-  }
-  case Instruction::Add:
-  case Instruction::FAdd:
-  case Instruction::Sub:
-  case Instruction::FSub:
-  case Instruction::Mul:
-  case Instruction::FMul:
-  case Instruction::UDiv:
-  case Instruction::SDiv:
-  case Instruction::FDiv:
-  case Instruction::URem:
-  case Instruction::SRem:
-  case Instruction::FRem:
-  case Instruction::Shl:
-  case Instruction::LShr:
-  case Instruction::AShr:
-  case Instruction::And:
-  case Instruction::Or:
-  case Instruction::Xor: {
-    TargetTransformInfo::OperandValueKind Op1VK =
-      getOperandInfo(I->getOperand(0));
-    TargetTransformInfo::OperandValueKind Op2VK =
-      getOperandInfo(I->getOperand(1));
-    return TTI->getArithmeticInstrCost(I->getOpcode(), I->getType(), Op1VK,
-                                       Op2VK);
-  }
-  case Instruction::Select: {
-    const SelectInst *SI = cast<SelectInst>(I);
-    Type *CondTy = SI->getCondition()->getType();
-    return TTI->getCmpSelInstrCost(I->getOpcode(), I->getType(), CondTy);
-  }
-  case Instruction::ICmp:
-  case Instruction::FCmp: {
-    Type *ValTy = I->getOperand(0)->getType();
-    return TTI->getCmpSelInstrCost(I->getOpcode(), ValTy);
-  }
-  case Instruction::Store: {
-    const StoreInst *SI = cast<StoreInst>(I);
-    Type *ValTy = SI->getValueOperand()->getType();
-    return TTI->getMemoryOpCost(I->getOpcode(), ValTy,
-                                SI->getAlignment(),
-                                SI->getPointerAddressSpace());
-  }
-  case Instruction::Load: {
-    const LoadInst *LI = cast<LoadInst>(I);
-    return 3 + TTI->getMemoryOpCost(I->getOpcode(), I->getType(),
-                                LI->getAlignment(),
-                                LI->getPointerAddressSpace());
-  }
-  case Instruction::ZExt:
-  case Instruction::SExt:
-  case Instruction::FPToUI:
-  case Instruction::FPToSI:
-  case Instruction::FPExt:
-  case Instruction::PtrToInt:
-  case Instruction::IntToPtr:
-  case Instruction::SIToFP:
-  case Instruction::UIToFP:
-  case Instruction::Trunc:
-  case Instruction::FPTrunc:
-  case Instruction::BitCast:
-  case Instruction::AddrSpaceCast: {
-    Type *SrcTy = I->getOperand(0)->getType();
-    return TTI->getCastInstrCost(I->getOpcode(), I->getType(), SrcTy);
-  }
-  case Instruction::ExtractElement: {
-    const ExtractElementInst * EEI = cast<ExtractElementInst>(I);
-    ConstantInt *CI = dyn_cast<ConstantInt>(I->getOperand(1));
-    unsigned Idx = -1;
-    if (CI)
-      Idx = CI->getZExtValue();
-
-    return TTI->getVectorInstrCost(I->getOpcode(),
-                                   EEI->getOperand(0)->getType(), Idx);
-  }
-  case Instruction::InsertElement: {
-    const InsertElementInst * IE = cast<InsertElementInst>(I);
-    ConstantInt *CI = dyn_cast<ConstantInt>(IE->getOperand(2));
-    unsigned Idx = -1;
-    if (CI)
-      Idx = CI->getZExtValue();
-    return TTI->getVectorInstrCost(I->getOpcode(),
-                                   IE->getType(), Idx);
-  }
-  case Instruction::ShuffleVector: {
-    // Randomly selected value TargetTransformInfo doesn't have a generic shuffle cost...
-    return 4;
-  }
-  case Instruction::Call:
-    if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
-      SmallVector<Type*, 4> Tys;
-      for (unsigned J = 0, JE = II->getNumArgOperands(); J != JE; ++J)
-        Tys.push_back(II->getArgOperand(J)->getType());
-
-      return TTI->getIntrinsicInstrCost(II->getIntrinsicID(), II->getType(),
-                                        Tys);
-    }
-
-    if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
-      ImmutableCallSite CS(cast<Instruction>(I));
-      if (const Function *F = CS.getCalledFunction()) {
-        return TTI->getCallCost(F);
-      }
-    }
-    return -1;
-  default:
-    // We don't have any information on this instruction.
-    return -1;
-  }
-}
 
 //***************************************************************************
 // Schedule operations and generate transformed loop
@@ -980,7 +841,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
                Mobility = ALAP - ASAP,
                Depth    = ASAP,
                Height   = LastOperationStart - ALAP,
-               Cost     = getInstructionCost(I, TTI);
+               Cost     = CMA->getInstructionCost(I);
 
       DEBUG(
         dbgs() << "  " << ASAP << " " << ALAP << " " << Mobility << " " << Depth << " " << Height << " " << Cost;
@@ -1005,9 +866,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         if(dep && AlreadyScheduled[dep]) {
           unsigned userStart;
           if(isa<PHINode>(dep)) {
-            userStart = std::max(ScheduledNodes[dep] - getInstructionCost(I, TTI), II) - II;
+            userStart = std::max(ScheduledNodes[dep] - CMA->getInstructionCost(I), II) - II;
           } else {
-            userStart = ScheduledNodes[dep] - getInstructionCost(I, TTI);
+            userStart = ScheduledNodes[dep] - CMA->getInstructionCost(I);
           }
           LateStart = std::min(LateStart, userStart);
           ScheduleDirection = Up;
@@ -1020,7 +881,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         Instruction *op = dyn_cast<Instruction>(O);
 
         if(op && AlreadyScheduled[op]) {
-          unsigned operandFinish = ScheduledNodes[op]; + getInstructionCost(op, TTI);
+          unsigned operandFinish = ScheduledNodes[op]; + CMA->getInstructionCost(op);
           if(isa<PHINode>(I)) {
             operandFinish = std::min(operandFinish - II, operandFinish);
           }
@@ -1044,7 +905,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       // Classify operation type, distinguish between Vector, Scalar, and Free operations
       // Also count vector operations as scalar operations when no separate vector units are available
       bool isVectorOperation = VectorFUCount != 0 && (isa<ExtractElementInst>(I) || I->getType()->isVectorTy());
-      bool isFreeOperation = getInstructionCost(I, TTI) == 0;
+      bool isFreeOperation = CMA->getInstructionCost(I) == 0;
 
       // Find free slot for scheduling
       unsigned ScheduleAt;
@@ -1057,7 +918,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
             bool ResourceAvailable;
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
-            if(((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
+            if(((ScheduleAt + CMA->getInstructionCost(I))/II - ScheduleAt/II) > 1) {
               DEBUG(dbgs() << "LP: Could not fold operation over more than one iteration\n");
               continue;
             }
@@ -1084,7 +945,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
             bool ResourceAvailable;
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
-            if(((ScheduleAt + getInstructionCost(I, TTI))/II - ScheduleAt/II) > 1) {
+            if(((ScheduleAt + CMA->getInstructionCost(I))/II - ScheduleAt/II) > 1) {
               DEBUG(dbgs() << "LP: Could not fold operation over more than one iteration\n");
               continue;
             }
@@ -1771,7 +1632,7 @@ unsigned LoopPipeline::scheduleASAP(BasicBlock *B, PartialSchedule &schedule) {
 
         if( Op->getParent() == B ) {
           // get maximum schedule time
-          OperandsASAP = std::max(OperandsASAP, schedule[Op] + getInstructionCost(Op, TTI));
+          OperandsASAP = std::max(OperandsASAP, schedule[Op] + CMA->getInstructionCost(Op));
         }
       }
     }
@@ -1798,7 +1659,7 @@ void LoopPipeline::scheduleALAP(BasicBlock *B, unsigned LastOperationStart, Part
 
       if( Dep->getParent() == B && schedule.find(Dep) != schedule.end() ) {
         // get minimum schedule time
-        DepsALAP = std::min(DepsALAP, schedule[Dep]-getInstructionCost(I, TTI));
+        DepsALAP = std::min(DepsALAP, schedule[Dep]-CMA->getInstructionCost(I));
       }
     }
     schedule[II] = DepsALAP;
