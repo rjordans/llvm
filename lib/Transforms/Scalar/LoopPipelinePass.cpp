@@ -198,6 +198,7 @@ namespace {
 char LoopPipeline::ID = 0;
 INITIALIZE_PASS_BEGIN(LoopPipeline, "loop-pipeline",
                 "Software pipeline inner-loops", false, false)
+INITIALIZE_PASS_DEPENDENCY(CostModelAnalysis)
 INITIALIZE_PASS_DEPENDENCY(DependenceAnalysis)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
