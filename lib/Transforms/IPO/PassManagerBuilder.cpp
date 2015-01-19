@@ -275,8 +275,12 @@ void PassManagerBuilder::populateModulePassManager(PassManagerBase &MPM) {
     MPM.add(createLoopUnrollPass());    // Unroll small loops
 
 #ifndef TARGET_IS_NOT_SHAVE
-  if (LoopPipeline)
+  if (LoopPipeline) {
     MPM.add(createLoopPipelinePass());    // Software-pipeline loops
+    MPM.add(createInstructionCombiningPass());
+    addExtensionsToPM(EP_Peephole, MPM);
+    MPM.add(createCFGSimplificationPass());
+  }
 #endif
 
   if (!DisableUnitAtATime) {

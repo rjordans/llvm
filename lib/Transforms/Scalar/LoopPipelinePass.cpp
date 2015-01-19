@@ -1467,9 +1467,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     Type *ConditionType = LoopBr->getCondition()->getType();
 
     if(LoopBr->getSuccessor(0) == LoopBody) {
-      PrologueBranchValue = ConstantInt::getTrue(ConditionType);
-    } else {
       PrologueBranchValue = ConstantInt::getFalse(ConditionType);
+    } else {
+      PrologueBranchValue = ConstantInt::getTrue(ConditionType);
     }
   } else {
     PrologueBranchValue =
@@ -1565,30 +1565,19 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       // changes
       DEBUG(dbgs() << "LP: Discarding pipelined loop as unused\n");
 
-      // Cleanup, remove pipelined loop and all other stuff we inserted
-#if 0
-      Epilogue->eraseFromParent();
-      LI->removeBlock(PipelinedBody);
-      SE->forgetLoop(Lp);
-      PipelinedBody->eraseFromParent();
-      Prologue->eraseFromParent();
-#endif
-      // Keep old branch (do nothing)
+      // Keep old branch (do nothing), the new loop is unreachable and will be
+      // removed during cleanup
     } else {
       // The old loop won't get executed, remove it
       DEBUG(dbgs() << "LP: Discarding original loop as unused\n");
-
-      // De-register and remove old loop
-      LI->removeBlock(LoopBody);
-      LoopBody->eraseFromParent();
 
       // Insert new branch
       TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
       BranchInst::Create(Prologue, OldBranch);
       OldBranch->eraseFromParent();
 
-      // Merge prologue and preheader blocks
-      MergeBlockIntoPredecessor(Prologue);
+      // The old loop won't get executed and is unreachable now.  Cleanup is
+      // performed after this pass finishes and will remove the old loop.
     }
   }
 
@@ -1601,17 +1590,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   for(auto translationmap : TranslationMaps) {
     delete translationmap;
   }
-
-  // Invalidate old loop in SCEV cache so that its itteration count can be
-  // reconsidered
-  SE->forgetLoop(L);
-
-  // Fixme: Cleanup
-  //
-  // Constant propagation within blocks has been done but may result in an
-  // always true or false for the latch condition.  Recognizing this allows for
-  // elimination of either the original or pipelined loop and provides further
-  // simplification of the generated code.
 
   // Done
   LoopsPipelined++;
