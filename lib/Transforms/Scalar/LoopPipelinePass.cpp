@@ -660,15 +660,17 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
             if(tV > tI || (tV == tI && mV > mI) ) v = I;
           }
-          OrderedNodes.push_back(*v);
-          AlreadyOrdered[*v] = true;
+          auto SelectedOp = *v;
+          OrderedNodes.push_back(SelectedOp);
+          AlreadyOrdered[SelectedOp] = true;
 
           // Update R as R := R - {v} \union (Pred(v) \intersect S)
+          Ready.erase(v);
           for(auto I : *CurrentPrioritySet) {
             if(AlreadyOrdered[I])
               continue;
 
-            for(auto U : (*v)->users()) {
+            for(auto U : SelectedOp->users()) {
               Instruction *II = dyn_cast<Instruction>(U);
               if(!II) continue;
 
@@ -682,8 +684,8 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           }
 
           // Update PredecessorListO and SuccessorListO
-          SuccessorListO.erase(*v);
-          PredecessorListO.erase(*v);
+          SuccessorListO.erase(SelectedOp);
+          PredecessorListO.erase(SelectedOp);
           for(auto I : OrderedNodes) {
             for(auto &O : I->operands()) {
               Instruction *II = dyn_cast<Instruction>(O);
@@ -701,8 +703,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
                 SuccessorListO.insert(II);
             }
           }
-
-          Ready.erase(v);
         }
 
         // add intersection of pred_L(O) with S to R
@@ -727,15 +727,17 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
             if(tV < tI || (tV == tI && mV > mI) ) v = I;
           }
-          OrderedNodes.push_back(*v);
-          AlreadyOrdered[*v] = true;
+          auto SelectedOp = *v;
+          OrderedNodes.push_back(SelectedOp);
+          AlreadyOrdered[SelectedOp] = true;
 
           // Update R as R := R - {v} \union (Suc(v) \intersect S)
+          Ready.erase(v);
           for(auto I : *CurrentPrioritySet) {
             if(AlreadyOrdered[I])
               continue;
 
-            for(auto &O : (*v)->operands()) {
+            for(auto &O : SelectedOp->operands()) {
               Instruction *II = dyn_cast<Instruction>(O);
               if(!II) continue;
 
@@ -749,8 +751,8 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           }
 
           // Update PredecessorListO and SuccessorListO
-          SuccessorListO.erase(*v);
-          PredecessorListO.erase(*v);
+          SuccessorListO.erase(SelectedOp);
+          PredecessorListO.erase(SelectedOp);
           for(auto I : OrderedNodes) {
             for(auto &O : I->operands()) {
               Instruction *II = dyn_cast<Instruction>(O);
@@ -768,7 +770,6 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
                 SuccessorListO.insert(II);
             }
           }
-          Ready.erase(v);
         }
         // add intersection of suc_L(O) with S to R
         for(auto I : SuccessorListO)
