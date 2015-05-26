@@ -1034,12 +1034,12 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   BasicBlock *OldExitBlock = L->getExitBlock();
   Loop *ParentLoop = L->getParentLoop();
 
-  LLVMContext &C = OldPreheaderBlock->getContext();
-
   if(!OldPreheaderBlock || !OldExitBlock) {
     DEBUG(dbgs() << "LP: Failed to create loop preheader or exit block for prologue and epilogue creation\n");
     return false;
   }
+
+  LLVMContext &C = OldPreheaderBlock->getContext();
 
   // Create a new loop structure for pipelined loop so that we can keep the original loop as a backup...
   BasicBlock *Prologue = BasicBlock::Create(C, LoopBody->getName()+".lp.prologue", OldPreheaderBlock->getParent(), OldExitBlock);
