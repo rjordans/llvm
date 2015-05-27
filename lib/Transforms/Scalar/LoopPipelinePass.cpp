@@ -943,13 +943,18 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
         // Check resource availability
         if(!isFreeOperation && !IgnoreResourceConstraints) {
-          for( ; ScheduleAt <= EarlyStart; ScheduleAt--) {
+          for( ; ScheduleAt >= EarlyStart; ScheduleAt--) {
             bool ResourceAvailable;
 
             // Skip time slots for which the current operation would cross multiple iteration bounds
             if(((ScheduleAt + CMA->getInstructionCost(I))/II - ScheduleAt/II) > 1) {
               DEBUG(dbgs() << "LP: Could not fold operation over more than one iteration\n");
-              continue;
+              // Special case ScheduleAt == 0 to avoid an infinite loop due to integer
+              // wraparound during scheduling
+              if(ScheduleAt == 0) {
+				SchedulingDone = false;
+			    break;
+			  } else continue;
             }
 
             if(isVectorOperation)
@@ -960,7 +965,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
           }
 
           // Fail if no free slot is found (and unset SchedulingDone)
-          if(ScheduleAt < EarlyStart) {
+          if(!SchedulingDone || ScheduleAt < EarlyStart) {
             SchedulingDone = false;
             break;
           }
