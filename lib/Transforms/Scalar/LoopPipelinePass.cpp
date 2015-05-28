@@ -952,9 +952,9 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
               // Special case ScheduleAt == 0 to avoid an infinite loop due to integer
               // wraparound during scheduling
               if(ScheduleAt == 0) {
-				SchedulingDone = false;
-			    break;
-			  } else continue;
+                SchedulingDone = false;
+                break;
+              } else continue;
             }
 
             if(isVectorOperation)
@@ -1378,6 +1378,35 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
 
               // Get replacement operand
               Value *NewOp = (*TranslationMaps[stage-distance])[Op];
+              if(distance) {
+                // If distance > 0 then the incomming edge is in the kernel and
+                // we need a phi node to select between the kernel value and
+                // the one from the prologue
+
+                // These need extra phi nodes in the kernel construction which
+                // are currently not generated
+                assert(distance == 1 && "LP: FATAL unsupported dependency length");
+
+                // Find phi node from kernel and clone it into the epilogue
+                PHINode *OldPhi;
+                for(auto U : NewOp->users()) {
+                  if((OldPhi = dyn_cast<PHINode>(U)))
+                    break;
+                }
+
+                // Construct new phi node and copy the value name from the parent
+                PHINode *NewPhi = cast<PHINode>(OldPhi->clone());
+
+                if(Op->hasName()) NewPhi->setName(Op->getName()+".lp.epilogue.phi");
+
+                // Insert into epilogue
+                Epilogue->getInstList().push_front(NewPhi);
+
+                PhiNodeMap[NewPhi] = Op;
+                NewOp = NewPhi;
+              } else {
+                NewOp = (*TranslationMaps[stage-distance])[Op];
+              }
               assert(NewOp && "Undefined node encountered during rewriting");
 
               // Replace operand
