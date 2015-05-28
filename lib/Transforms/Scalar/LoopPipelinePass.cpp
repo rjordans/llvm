@@ -1333,7 +1333,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
    */
   for(stage++; stage < 2 * NumberOfInterleavedIterations - 1; stage++) {
     // Create new translation map
-    DenseMap<Value *, Value *> *TranslationMap = new DenseMap<Value *, Value *>();
+    TranslationMap = new DenseMap<Value *, Value *>();
 
     // Store translation map
     TranslationMaps.push_back(TranslationMap);
@@ -1451,36 +1451,49 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
   //
   // For each live out variable of the LoopBody, add a phi-node to the
   // OldExitBlock and replace all uses of the original value within the old
-  // exit block with the new phi-node.
+  // exit block with the new phi node.
+
+  // Fist construct a the set of new phi nodes
   for(auto I = LoopBody->begin(), E = LoopBody->end(); I != E; I++) {
-    for(auto U : I->users()) {
+    PHINode *NewPhi = nullptr;
+
+    // See if I has uses outside of the original loop and construct a new phi
+    // node
+    for(auto *U : I->users()) {
       Instruction *Dep = dyn_cast<Instruction>(U);
       if(Dep && Dep->getParent() != LoopBody) {
-        assert(isa<PHINode>(Dep)
-           && "Non-phi dependency found, loop not in canonical form");
+        // Add phi-node to OldExitBlock to replace this dependency with a
+        // phi(I, (*TranslationMap)[I])
 
-        if(PHINode *OldPhi = dyn_cast<PHINode>(Dep)) {
-          // Check if there is an edge already
-          if(OldPhi->getBasicBlockIndex(Epilogue) != -1)
-            continue;
+        NewPhi = PHINode::Create( I->getType(), 2, "",
+            OldExitBlock->getFirstNonPHI());
 
-          // Find definition of new incomming value
-          Value *NewValue = nullptr;
-          for(int i = 2*NumberOfInterleavedIterations - 2;
-                 !NewValue && i > 0; i--) {
-            NewValue = (*TranslationMaps[i])[I];
-            if(NewValue) {
-              DEBUG(
-                dbgs() << "LP: Found NewValue " << i;
-                NewValue->dump()
-              );
-            }
-          }
+        // Set name
+        if(I->hasName()) NewPhi->setName(I->getName()+".lp.loopmerge.phi");
 
-          // Add incomming value
-          assert(NewValue && "New value lookup failed?!?");
-          OldPhi->addIncoming(NewValue, Epilogue);
-        }
+        // Set edges
+        NewPhi->addIncoming(I, LoopBody);
+        NewPhi->addIncoming((*TranslationMap)[I], Epilogue);
+
+        // We don't need to check the other dependencies, we don't care if
+        // there are more uses outside of the loop, we've already created the
+        // new phi node...
+        break;
+      }
+    }
+
+    // If we constructed a new phi node, replace all uses of I outside of the
+    // original loop body with the newly created phi node
+    // (except for the new phi node itself)
+    if(NewPhi) {
+      auto UI = I->use_begin(), UE = I->use_end();
+      for(; UI != UE;) {
+        Use &U = *UI;
+        ++UI;
+        auto *Usr = dyn_cast<Instruction>(U.getUser());
+        if (Usr && (Usr == NewPhi || Usr->getParent() != LoopBody))
+          continue;
+        U.set(NewPhi);
       }
     }
   }
