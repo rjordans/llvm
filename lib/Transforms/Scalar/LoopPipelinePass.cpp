@@ -1491,7 +1491,7 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
         Use &U = *UI;
         ++UI;
         auto *Usr = dyn_cast<Instruction>(U.getUser());
-        if (Usr && (Usr == NewPhi || Usr->getParent() != LoopBody))
+        if (Usr && (Usr == NewPhi || Usr->getParent() == LoopBody))
           continue;
         U.set(NewPhi);
       }
