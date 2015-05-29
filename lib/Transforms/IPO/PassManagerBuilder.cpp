@@ -278,6 +278,7 @@ void PassManagerBuilder::populateModulePassManager(PassManagerBase &MPM) {
   if (LoopPipeline) {
     MPM.add(createLoopPipelinePass());    // Software-pipeline loops
     MPM.add(createInstructionCombiningPass());
+    MPM.add(createLoopDeletionPass());    // Delete dead loops
     addExtensionsToPM(EP_Peephole, MPM);
     MPM.add(createCFGSimplificationPass());
   }

@@ -1177,6 +1177,16 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     }
   }
 
+  // Add kernel bypass
+  // TODO check the loop condition to see if we can branch directly from the
+  // prologue to the epilogue
+  TerminatorInst *OldPrologueBranch = Prologue->getTerminator();
+  BranchInst::Create(
+      PipelinedBody, Epilogue,
+      ConstantInt::getTrue(cast<BranchInst>(LoopBody->getTerminator())->getCondition()->getType()),
+      OldPrologueBranch);
+  OldPrologueBranch->eraseFromParent();
+
 #if 1
   DEBUG(Prologue->dump());
 #endif
@@ -1516,16 +1526,18 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
     Type *ConditionType = LoopBr->getCondition()->getType();
 
     if(LoopBr->getSuccessor(0) == LoopBody) {
-      PrologueBranchValue = ConstantInt::getFalse(ConditionType);
-    } else {
       PrologueBranchValue = ConstantInt::getTrue(ConditionType);
+    } else {
+      PrologueBranchValue = ConstantInt::getFalse(ConditionType);
     }
   } else {
     PrologueBranchValue =
       (*TranslationMaps[NumberOfInterleavedIterations-3])[LoopBr->getCondition()];
   }
 
-  // Check if the branch condition actually is an Instruction or if it's a Constant
+  // Check if the branch condition actually is an Instruction and not a
+  // Constant.  If it is, we need to move the operations for computing the
+  // branch condition into the selector block.
   if(Instruction *PrologueBranchCond = dyn_cast<Instruction>(PrologueBranchValue)) {
     assert(PrologueBranchCond && "Could not find branch condition for prologue");
 
@@ -1581,54 +1593,18 @@ bool LoopPipeline::transformLoop(Loop *L, unsigned MII, CycleSet &cycles) {
       I->removeFromParent();
       I->insertBefore(OldPreheaderBlock->getTerminator());
     }
-
-    // Replace branch in selector block with a conditional branch
-    TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
-    if(LoopBr->getSuccessor(0) == LoopBody) {
-      BranchInst::Create(Prologue, LoopBody, PrologueBranchCond, OldBranch);
-    } else {
-      BranchInst::Create(LoopBody, Prologue, PrologueBranchCond, OldBranch);
-    }
-    OldBranch->eraseFromParent();
-
-  } else {
-    // Got a constant? value as loop condition which means we can do some
-    // cleanup.  Either we never enter the kernel loop and can drop the loop
-    // from existence.  Or we never need the backup original loop and can
-    // remove that one
-    ConstantInt *BranchCondition = dyn_cast<ConstantInt>(PrologueBranchValue);
-
-    assert(BranchCondition
-           && "Expected a constant branch condition in the prologue");
-
-    DEBUG(dbgs() << "LP: Found constant loop entry condition ";
-      BranchCondition->dump());
-
-    // New loop gets executed when:
-    // - Either BranchCondition == true & LoopBr->getSuccessor(0) == LoopBody
-    // - Or BranchCondition == false & LoopBr->getSuccessor(1) == LoopBody
-    if(BranchCondition->equalsInt(0) ^ (LoopBr->getSuccessor(0) == LoopBody)) {
-      // TODO: Maybe we could figure this out earlier and save some trouble ;)
-      //
-      // The new loop won't get executed, just keep the old one and undo our
-      // changes
-      DEBUG(dbgs() << "LP: Discarding pipelined loop as unused\n");
-
-      // Keep old branch (do nothing), the new loop is unreachable and will be
-      // removed during cleanup
-    } else {
-      // The old loop won't get executed, remove it
-      DEBUG(dbgs() << "LP: Discarding original loop as unused\n");
-
-      // Insert new branch
-      TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
-      BranchInst::Create(Prologue, OldBranch);
-      OldBranch->eraseFromParent();
-
-      // The old loop won't get executed and is unreachable now.  Cleanup is
-      // performed after this pass finishes and will remove the old loop.
-    }
   }
+
+  // Replace branch in selector block with a conditional branch, we use dead
+  // loop elimination later to clean-up constant branches together with the
+  // old loop structures
+  TerminatorInst *OldBranch = OldPreheaderBlock->getTerminator();
+  if(LoopBr->getSuccessor(0) == LoopBody) {
+    BranchInst::Create(Prologue, LoopBody, PrologueBranchValue, OldBranch);
+  } else {
+    BranchInst::Create(LoopBody, Prologue, PrologueBranchValue, OldBranch);
+  }
+  OldBranch->eraseFromParent();
 
   /*
    * Clean-up allocated structures and generated code
